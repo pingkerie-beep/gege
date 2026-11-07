@@ -1113,11 +1113,15 @@ local function guardPNBDrops(b,tx,ty)
     local list=records(b)
     local cell={x=tx,y=ty}
     local count,visited,complete,fullItem=0,0,list~=nil,nil
+    local stuck=CONFIG.stuckDrops
+    if not stuck then stuck={};CONFIG.stuckDrops=stuck end
+    local uids,important={},false
     for _,r in next,list or {} do
         visited+=1
         if visited>CONFIG.scanLimit then complete=false;break end
-        if worldDrop(b,r) and inDropCell(r,cell) then
-            count+=1
+        if worldDrop(b,r) and inDropCell(r,cell) and not stuck[r.uid] then
+            count+=1;table.insert(uids,r.uid)
+            if r.id~=112 then important=true end
             local room=r.id~=112 and inventoryNumber(b,"room",r.id)
             if room==0 or autoLoop and r.id==autoLoop.block and room and room<math.min(r.n,32) then
                 fullItem=fullItem or r
@@ -1128,11 +1132,11 @@ local function guardPNBDrops(b,tx,ty)
             end
         end
     end
-    if count==0 and complete then pickupGate=nil;return false end
+    if count==0 and complete then pickupGate=nil;if autoLoop then autoLoop.hopTries=0;autoLoop.buried=nil;autoLoop.relocTries=0 end;return false end
     local _,_,world=livePosition(b)
     local reason=count>0 and "Collecting drops from the PNB tile before placing or breaking." or "Waiting for live drop data."
     if not pickupGate or pickupGate.x~=tx or pickupGate.y~=ty or pickupGate.world~=world then
-        pickupGate={x=tx,y=ty,world=world}
+        pickupGate={x=tx,y=ty,world=world,since=os.clock()}
         log(string.format("PNB pickup guard: holding tile (%d,%d); collect and verify its drops before place/break.",tx,ty))
     end
     pickupGate.count,pickupGate.reason=count,reason
@@ -1160,9 +1164,79 @@ local function guardPNBDrops(b,tx,ty)
             return true
         end
     end
+    -- PATCH watchdog: the gate may never hold PNB/farm longer than 10s, whatever the cause
+    -- (no live drop data, endless pending pickup, unreachable drop).
+    if os.clock()-(pickupGate.since or os.clock())>10 then
+        for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
+        pickupGate=nil
+        log(string.format("PNB pickup guard: watchdog 10s on (%d,%d); releasing hold and continuing.",tx,ty))
+        return false
+    end
+    -- Gems alone are not worth waiting for; blocks and seeds are.
+    -- PATCH: drops that were buried under a re-placed block (already broken now) hop at once.
+    local waitFor=important and 4 or 1.5
+    if autoLoop and autoLoop.buried and autoLoop.buried.x==tx and autoLoop.buried.y==ty then waitFor=.8 end
+    if count>0 and complete and not pending and os.clock()-(pickupGate.since or os.clock())>waitFor then
+        local a=autoLoop
+        if important and a and farm and not a.hop and not a.paused and a.stage=="PNB" and (a.hopTries or 0)<3 then
+            -- Pickup denials are bound to the character's position, so hop to a
+            -- neighbouring tile (supported steps, as in the farm) and collect from there.
+            a.hopTries=(a.hopTries or 0)+1
+            local set={}
+            for _,uid in ipairs(uids) do set[uid]=true end
+            a.hop={cell=cell,uids=uids,set=set,tries=a.hopTries,phase="go",at=os.clock()}
+            cycle,anchor,settings=nil,nil,nil;running=false;runButton.Text="PNB: OFF"
+            a.prep=nil;a.prepare=true;a.settle=nil
+            pickupGate=nil
+            log(string.format("PNB pickup guard: blocks/seeds on (%d,%d) not collected; hop %d/3 to collect them.",tx,ty,a.hopTries))
+            return true
+        end
+        -- PATCH: hops exhausted. Do not place a new block on top of the same drops:
+        -- pick a NEW PNB position (replacePNBHome avoids every cell that holds drops).
+        if important and a and farm and not a.paused and a.stage=="PNB" and (a.relocTries or 0)<3 then
+            for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
+            a.relocTries=(a.relocTries or 0)+1
+            a.blockedHome={x=tx,y=ty};a.buried=nil
+            a.prep=nil;a.prepare=true;a.settle=nil
+            cycle,anchor,settings=nil,nil,nil;running=false;runButton.Text="PNB: OFF"
+            pickupGate=nil
+            log(string.format("PNB pickup guard: drops on (%d,%d) stuck; moving PNB to a new tile (%d/3).",tx,ty,a.relocTries))
+            return true
+        end
+        -- Drops that stay uncollected must not freeze PNB: remember them and carry on.
+        for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
+        pickupGate=nil
+        log(string.format("PNB pickup guard: drops on (%d,%d) could not be collected; continuing PNB.",tx,ty))
+        return false
+    end
     startPickup(b,cell)
     if not pending and count>0 then pickupGate.reason="PNB is waiting for the tile's drops to be collected. Check pickup range and backpack space." end
     return true
+end
+-- PATCH: a block is (still / again) placed on a cell that holds uncollected blocks/seeds.
+-- Remember the cell: the block is broken first, then the pickup guard hops / relocates quickly.
+CONFIG.markBuried=function(b,tx,ty)
+    local a=autoLoop
+    if not a then return end
+    local now=os.clock()
+    if a.buriedScanAt and now-a.buriedScanAt<.5 then return end
+    a.buriedScanAt=now
+    local list=records(b)
+    if not list then return end
+    local stuck=CONFIG.stuckDrops or {}
+    local cell={x=tx,y=ty}
+    local visited=0
+    for _,r in next,list do
+        visited+=1
+        if visited>CONFIG.scanLimit then break end
+        if worldDrop(b,r) and r.id~=112 and inDropCell(r,cell) and not stuck[r.uid] then
+            if not a.buried or a.buried.x~=tx or a.buried.y~=ty then
+                log(string.format("PNB: uncollected drops under the block on (%d,%d); break it first, then move to collect.",tx,ty))
+            end
+            a.buried={x=tx,y=ty,at=now}
+            return
+        end
+    end
 end
 -- Four-neighbour A*: shortest route through unoccupied avatar-sized cells.
 local function gridRoute(width, height, sx, sy, gx, gy, blocked)
@@ -2067,7 +2141,7 @@ local function farmPlatformMove(f,m,dt,x,y)
     local function failed(reason,returned)
         if node and node.fromKey~=nil and node.toKey~=nil and node.fromKey~=node.toKey then
             local edge=tostring(node.fromKey)..">"..tostring(node.toKey)
-            f.motionEdges[edge]=os.clock()+(returned and 120 or 2)
+            f.motionEdges[edge]=os.clock()+(returned and 8 or 2)
             if node.kind~="walk" and node.kind~="start" then
                 local corridor="air:"..math.floor(node.fromKey/n.width)..">"..node.y..":"..math.floor(node.x/4)
                 local failures=f.motionEdges.failures or {};f.motionEdges.failures=failures
@@ -2081,11 +2155,11 @@ local function farmPlatformMove(f,m,dt,x,y)
         farmVelocity(n,0)
         f.motion=nil
         if f.target and (f.target.kind=="plant" or f.target.kind=="harvest") then
-            f.blockedOrder=f.target;f.routeRetryAt=os.clock()+2
+            f.blockedOrder=f.target;f.routeRetryAt=os.clock()+.4
             farmNote="The supported step was rejected; the first eligible tile stays selected."
             f.stepRejected=nil
             if returned then
-                f.stepRejected={x=x,y=y,reason=reason}
+                f.stepRejected={x=x,y=y,reason=reason,at=os.clock()}
                 farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
             end
         else
@@ -2365,11 +2439,14 @@ local function farmTick()
     end
     if (lease.outstanding or 0)>0 or os.clock()<(f.resumeAt or 0) then return end
     if f.stepRejected then
-        if math.abs(x-f.stepRejected.x)<=.5 and math.abs(y-f.stepRejected.y)<=.5 then
-            farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
+        local r=f.stepRejected
+        local here=math.abs(x-r.x)<=.5 and math.abs(y-r.y)<=.5
+        if here and os.clock()-(r.at or 0)<.6 then
+            farmNote="The game returned this supported step. Retrying shortly."
             return
         end
-        f.stepRejected=nil;f.routeRetryAt=nil;f.pathSearch=nil
+        -- PATCH: timeout -> lepas latch dan coba rute lagi (tidak diam selamanya)
+        f.stepRejected=nil;f.routeRetryAt=nil;f.pathSearch=nil;f.motion=nil
     end
     if n.glide and not farmStanding(n,x,y) then
         farmVelocity(n,0)
@@ -2582,7 +2659,17 @@ end
 local function updatePNB(b)
     if not running or pending or (lease.outstanding or 0)>0 or os.clock()<nextAction then return end
     if autoLoop and (autoLoop.prep or autoLoop.job) then return end
-    if guardPNBDrops(b,anchor.tx,anchor.ty) then return end
+    -- A block already on the tile is simply hit: drops lying in its cell never hold PNB.
+    -- The pickup guard only matters before the next block is placed.
+    local placed=cycle~=nil
+    if not placed and b.netCall then
+        local native=autoLoop and autoLoop.native or settings.native
+        placed=native~=nil and farmTile(native,anchor.tx,anchor.ty,settings.layer)==settings.id
+    end
+    if placed then
+        pickupGate=nil
+        CONFIG.markBuried(b,anchor.tx,anchor.ty)
+    elseif guardPNBDrops(b,anchor.tx,anchor.ty) then return end
     if not cycle then
         if os.clock()<(settings.placeAfter or 0) then return end
         local count=inventoryNumber(b,"count",settings.id)
@@ -2898,8 +2985,9 @@ local function replacePNBHome(a,x,y)
 end
 local function startupBreak(a,x,y)
     local p,n=a.prep,a.native
-    if guardPNBDrops(n.b,p.x,p.y) then p.at=os.clock();return end
     local current=farmTile(n,p.x,p.y,p.layer)
+    -- Drops on the tile never hold a block that is already placed; it is broken first.
+    if current==a.block then pickupGate=nil;CONFIG.markBuried(n.b,p.x,p.y) end
     if current==0 then
         a.prep=nil;a.prepare=false;a.nextCheck=0;nextCollect=0
         log(string.format("BREAK AWAL: hit native selesai (%d,%d), %d pukulan; memeriksa inventory server sebelum lanjut.",p.x,p.y,p.hits))
@@ -2927,6 +3015,76 @@ local function startupBreak(a,x,y)
     p.hits+=1;p.nextAt=os.clock()+math.max(n.b.netCall and .05 or .2,a.interval)
     farmNote=string.format("BREAK AWAL %s (%d,%d), pukulan %d; belum menaruh blok baru.",p.layer,p.x,p.y,p.hits)
 end
+-- Hop to a neighbouring tile and collect leftover blocks/seeds (see guardPNBDrops).
+CONFIG.hopStep=function(a,x,y)
+    local h,f=a.hop,farm
+    local function finish(ok)
+        if ok then
+            a.hopTries=0
+            log("PNB hop: leftover drops collected; continuing PNB.")
+        else
+            local stuck=CONFIG.stuckDrops
+            if not stuck then stuck={};CONFIG.stuckDrops=stuck end
+            for _,uid in ipairs(h.uids) do stuck[uid]=os.clock() end
+            log("PNB hop: leftover drops could not be collected; moving PNB to a new tile.")
+            if (a.relocTries or 0)<3 and h.cell then
+                a.relocTries=(a.relocTries or 0)+1
+                a.blockedHome={x=h.cell.x,y=h.cell.y};a.buried=nil
+            end
+        end
+        a.hop=nil
+        if f then f.target,f.motion=nil,nil end
+        a.prepare=true;a.prep=nil;a.settle=nil
+    end
+    if not f or not f.native then a.hop=nil;return end
+    a.progressAt=os.clock() -- hopping must not trip the 15s PNB progress timer
+    local n=f.native
+    if h.phase=="go" then
+        local sx,sy=math.floor(x),math.floor(y-.001)
+        local side=h.tries%2==1 and 1 or -1
+        for _,dx in ipairs({side,-side,2*side,-2*side}) do
+            local tx=sx+dx
+            if tx>=0 and tx<n.width and sy>=0 and sy<n.height and not n.solid(tx,sy) then
+                local stand={x=tx,y=sy,key=sy*n.width+tx,kind="hop"}
+                local route=farmPlan(f,stand,x,y)
+                if route then
+                    f.target,f.motion=stand,route
+                    h.stand,h.phase,h.at=stand,"move",os.clock()
+                    farmNote="Hopping to a neighbouring tile to collect leftover blocks or seeds."
+                    traceMotion(string.format("PNB HOP %d/3 -> (%d,%d)",h.tries,tx,sy))
+                    return
+                end
+            end
+        end
+        finish(false);return
+    elseif h.phase=="move" then
+        if f.motion then
+            if os.clock()-h.at>8 then finish(false) end
+            return
+        end
+        local st=h.stand
+        if math.abs(x-(st.x+.5))<=.3 and math.abs(y-(st.y+.999))<=.4 then
+            h.phase,h.at="collect",os.clock()
+            f.target=nil
+            for _,uid in ipairs(h.uids) do denied[uid]=nil;retryAt[uid]=nil end
+            nextCollect=0
+        elseif os.clock()-h.at>8 then finish(false) end
+        return
+    end
+    local list=records(n.b)
+    local left=0
+    for _,r in next,list or {} do
+        if h.set[r.uid] and worldDrop(n.b,r) then left+=1 end
+    end
+    if left==0 then finish(true);return end
+    farmNote="Collecting leftover blocks or seeds after the hop."
+    if os.clock()-h.at>3.5 then
+        if h.tries<3 then
+            a.hopTries=h.tries+1
+            a.hop={cell=h.cell,uids=h.uids,set=h.set,tries=a.hopTries,phase="go",at=os.clock()}
+        else finish(false) end
+    end
+end
 local function loopTick()
     local a,f=autoLoop,farm
     if not a or a.paused or not f or pending or f.action or f.job or f.correction or cycle then return end
@@ -2934,6 +3092,7 @@ local function loopTick()
     local x,y,world=livePosition(a.native.b)
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
     if a.deposit then depositTick(a,x,y);return end
+    if a.hop then CONFIG.hopStep(a,x,y);return end
     if a.blockedHome then
         if replacePNBHome(a,x,y) then
             a.blockedHome=nil;pickupGate=nil
@@ -2971,6 +3130,7 @@ local function loopTick()
     end
     if a.stage=="CEK" then
         if a.blocks>0 or a.prepare and farmTile(a.native,a.home.tx,a.home.ty,a.layer)==a.block then loopStage(a,"PNB")
+        elseif a.pnbOnly then halt("Out of blocks; PNB finished.",true);report(true);return
         else loopStage(a,a.seeds>0 and "TANAM" or "PANEN") end
     end
     if a.stage=="PNB" then
@@ -3001,6 +3161,7 @@ local function loopTick()
                 log("BREAK AWAL: menyelaraskan petak PNB melalui hit native sebelum mulai tanam.")
                 startupBreak(a,x,y);return
             end
+            if a.pnbOnly then halt("Out of blocks; PNB finished.",true);report(true);return end
             loopStage(a,"TANAM");return
         end
         if os.clock()-(a.progressAt or os.clock())>15 then
@@ -3375,10 +3536,11 @@ onAction(loopButton,function()
         log("Isi Item ID blok, Pukul 1-50, Jeda 0.05-5 detik.");report(true);return
     end
     local a={block=id,seed=id+1,hits=hits,interval=interval,stage="JEDA",nextCheck=0,deposits=0,prepare=true,
-        progressAt=os.clock(),paused={reason="Mulai",retryAt=0,at=os.clock()}}
+        progressAt=os.clock(),pnbOnly=CONFIG.pnbOnly==true,paused={reason="Mulai",retryAt=0,at=os.clock()}}
     autoLoop=a;loopButton.Text="Siklus otomatis: ON"
     recoverLoop()
-    log("SIKLUS ON: PNB -> TANAM satu per satu -> PANEN satu per satu -> PNB; tetap ON sampai dihentikan manual.");report(true)
+    log(a.pnbOnly and "PNB ON: place & break + kolek otomatis dari siklus; tanpa tanam/panen; berhenti saat blok habis."
+        or "SIKLUS ON: PNB -> TANAM satu per satu -> PANEN satu per satu -> PNB; tetap ON sampai dihentikan manual.");report(true)
 end)
 onAction(layerButton,function()
     if autoLoop then log("Layer PNB mengikuti jenis blok native; Stop dahulu untuk menggantinya secara manual.");return end
@@ -3454,7 +3616,7 @@ end)
 connect(Input.WindowFocusReleased,function()
     if farm and not farm.preview then
         log("Auto Farm tetap aktif di latar; Stop/H untuk menghentikan.");report(true)
-    else halt("Roblox kehilangan fokus; PNB/kolek OFF.");report(true) end
+    else halt("PNB/kolek OFF.");report(true) end
 end)
 local moveRemote=remotes:FindFirstChild("MoveTo")
 if moveRemote then connect(moveRemote.OnClientEvent,farmServerMoved) end
@@ -3516,30 +3678,6 @@ bind(true)
 -- BEGIN PNB RAYFIELD UI
 -- Bundled by tools/build_rayfield_ui.py. Configuration never starts farming.
 local function installRayfield()
-    -- The original logo is a separate immutable PNG, cached in the executor workspace.
-local function genhubLogoAsset()
-    local custom=type(getcustomasset)=="function" and getcustomasset or type(getsynasset)=="function" and getsynasset
-        or type(rawget(env,"getcustomasset"))=="function" and rawget(env,"getcustomasset")
-        or type(rawget(env,"getsynasset"))=="function" and rawget(env,"getsynasset")
-    if not custom then return nil end
-    local filename="GenHub_Logo_ef26c494a3a5.png"
-    local function valid(data)
-        return type(data)=="string" and #data==731332 and data:sub(1,8)=="\137PNG\13\10\26\10"
-    end
-    local ok,bytes
-    if type(readfile)=="function" then ok,bytes=pcall(readfile,filename) end
-    if not ok or not valid(bytes) then
-        if type(writefile)~="function" then return nil end
-        ok,bytes=pcall(function()
-            return game:HttpGet("https://pnb-key-service.key-service.workers.dev/assets/genhub-logo-ef26c494a3a5.png")
-        end)
-        if not ok or not valid(bytes) then return nil end
-        if not pcall(writefile,filename,bytes) then return nil end
-    end
-    local loaded,uri=pcall(custom,filename)
-    return loaded and type(uri)=="string" and uri~="" and uri or nil
-end
-
     local bundledSource=[=====[
 --[[
 
@@ -5822,53 +5960,6 @@ local function fadeOutKeyUI(KeyMain)
 end
 
 function RayfieldLibrary:CreateWindow(Settings)
-    -- Replace the startup artwork before the upstream splash can become visible.
-    do
-        local image=type(Settings.BrandingImage)=="string" and Settings.BrandingImage~="" and Settings.BrandingImage or nil
-        local function create(class,props,parent)
-            local object=Instance.new(class)
-            for key,value in pairs(props) do object[key]=value end
-            object.Parent=parent;return object
-        end
-        local function logo(parent,name,size,position,anchor)
-            return create("ImageLabel",{Name=name,BackgroundTransparency=1,Image=image or "",Visible=image~=nil,
-                ImageTransparency=0,ImageColor3=Color3.fromRGB(255,255,255),ScaleType=Enum.ScaleType.Fit,
-                ImageRectOffset=Vector2.new(0,0),ImageRectSize=Vector2.new(0,0),
-                Size=size,Position=position,AnchorPoint=anchor},parent)
-        end
-        local splash=Rayfield:FindFirstChild("Loading")
-        if splash then
-            for _,child in ipairs(splash:GetChildren()) do
-                if child:IsA("GuiObject") then child.Visible=false end
-            end
-            local group=create("Frame",{Name="GenHubSplash",BackgroundTransparency=1,Size=UDim2.fromOffset(276,84),
-                Position=UDim2.new(.5,0,.5,0),AnchorPoint=Vector2.new(.5,.5)},splash)
-            logo(group,"GenHubLogo",UDim2.fromOffset(84,84),UDim2.fromOffset(0,0),Vector2.new(0,0))
-            create("TextLabel",{Name="GenHubTitle",Text="GenHub",TextSize=36,Font=Enum.Font.GothamSemibold,
-                TextColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=1,
-                TextXAlignment=image and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center,
-                Size=UDim2.new(1,image and -102 or 0,1,0),Position=UDim2.fromOffset(image and 102 or 0,0)},group)
-        end
-        local previous=LoadingFrame:FindFirstChild("GenHubLogo")
-        if previous then previous:Destroy() end
-        logo(LoadingFrame,"GenHubLogo",UDim2.fromOffset(56,56),UDim2.new(0,22,.5,0),Vector2.new(0,.5))
-        local inset=image and 92 or 26
-        LoadingFrame.Title.Position=UDim2.new(0,inset,.5,-10)
-        LoadingFrame.Subtitle.Position=UDim2.new(0,inset,.5,9)
-        LoadingFrame.Title.AnchorPoint=Vector2.new(0,.5)
-        LoadingFrame.Subtitle.AnchorPoint=Vector2.new(0,.5)
-        LoadingFrame.Title.Size=UDim2.new(1,-inset-18,0,22)
-        LoadingFrame.Subtitle.Size=UDim2.new(1,-inset-18,0,18)
-        local icon=Topbar:FindFirstChild("Icon")
-        if icon then
-            icon.Visible=image~=nil;icon.Image=image or ""
-            icon.ImageRectOffset=Vector2.new(0,0);icon.ImageRectSize=Vector2.new(0,0)
-            icon.ImageColor3=Color3.fromRGB(255,255,255);icon.ImageTransparency=0
-            icon.ScaleType=Enum.ScaleType.Fit
-            if image then Topbar.Title.Position=UDim2.new(0,47,.5,0) end
-        end
-    end
-
 	if Rayfield:FindFirstChild('Loading') then
 		if getgenv and not getgenv().rayfieldCached then
 			Rayfield.Enabled = true
@@ -5931,7 +6022,7 @@ function RayfieldLibrary:CreateWindow(Settings)
 	LoadingFrame.Subtitle.Text = Settings.LoadingSubtitle or "Interface Suite"
 
 	if Settings.LoadingTitle ~= "Rayfield Interface Suite" then
-		LoadingFrame.Version.Text = Settings.LoadingVersion or "GenHub 1.9.2"
+		LoadingFrame.Version.Text = "Rayfield UI"
 	end
 
 	if Settings.Icon and Settings.Icon ~= 0 and Topbar:FindFirstChild('Icon') then
@@ -7932,12 +8023,6 @@ function RayfieldLibrary:CreateWindow(Settings)
 	TweenService:Create(LoadingFrame.Title, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
 	TweenService:Create(LoadingFrame.Subtitle, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
 	TweenService:Create(LoadingFrame.Version, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
-    -- Upstream fades only its text; remove the added image before the tabs open.
-    do
-        local logo=LoadingFrame:FindFirstChild("GenHubLogo")
-        if logo then logo:Destroy() end
-    end
-
 	task.wait(0.1)
 	TweenService:Create(Main, TweenInfo.new(0.6, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = useMobileSizing and UDim2.new(0, 500, 0, 275) or UDim2.new(0, 500, 0, 475)}):Play()
 	TweenService:Create(Main.Shadow.Image, TweenInfo.new(0.5, Enum.EasingStyle.Exponential), {ImageTransparency = 0.6}):Play()
@@ -8033,123 +8118,6 @@ function RayfieldLibrary:CreateWindow(Settings)
 			})
 		--end
 	end
-
-    -- An owned community control, separate from Rayfield's Discord RPC integration.
-    do
-        local invite=Settings.CommunityInvite
-        if type(invite)=="string" and invite:match("^https://discord%.gg/[%w%-]+$") then
-            local links={}
-            local function watch(signal,callback)
-                links[#links+1]=signal:Connect(callback)
-            end
-            local function create(class,props,parent)
-                local object=Instance.new(class)
-                for key,value in pairs(props) do object[key]=value end
-                object.Parent=parent;return object
-            end
-            local function round(object,radius)
-                create("UICorner",{CornerRadius=UDim.new(0,radius)},object)
-            end
-            local white=Color3.fromRGB(255,255,255)
-            local accent=Color3.fromRGB(88,101,242)
-            -- Preserve the tab row's left edge even when it is center anchored.
-            local size,position=TabList.Size,TabList.Position
-            TabList.Size=UDim2.new(size.X.Scale,size.X.Offset-100,size.Y.Scale,size.Y.Offset)
-            TabList.Position=UDim2.new(position.X.Scale,position.X.Offset-100*TabList.AnchorPoint.X,
-                position.Y.Scale,position.Y.Offset)
-            local button=create("TextButton",{Name="GenHubDiscord",Text="Discord",TextSize=13,
-                Font=Enum.Font.GothamMedium,TextColor3=white,BackgroundColor3=accent,
-                BorderSizePixel=0,AutoButtonColor=true,Visible=false,ZIndex=15,
-                AnchorPoint=Vector2.new(1,TabList.AnchorPoint.Y),Size=UDim2.fromOffset(86,32),
-                Position=UDim2.new(1,-18,position.Y.Scale,position.Y.Offset)},Main)
-            round(button,16)
-            local panel=create("Frame",{Name="GenHubCommunity",Visible=false,Active=true,
-                BorderSizePixel=0,ZIndex=40,AnchorPoint=Vector2.new(1,0),
-                Size=UDim2.new(1,-36,0,178),Position=UDim2.new(1,-18,0,96)},Main)
-            create("UISizeConstraint",{MaxSize=Vector2.new(300,178)},panel)
-            round(panel,12)
-            local stroke=create("UIStroke",{Thickness=1,Transparency=.2},panel)
-            local title=create("TextLabel",{Name="Title",Text="GenHub Discord",TextSize=16,
-                Font=Enum.Font.GothamSemibold,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,
-                Position=UDim2.fromOffset(14,13),Size=UDim2.new(1,-56,0,24),ZIndex=41},panel)
-            local close=create("TextButton",{Name="Close",Text="×",TextSize=22,Font=Enum.Font.Gotham,
-                BackgroundTransparency=1,BorderSizePixel=0,Position=UDim2.new(1,-38,0,10),
-                Size=UDim2.fromOffset(28,28),ZIndex=42},panel)
-            local description=create("TextLabel",{Name="Description",TextSize=12,Font=Enum.Font.Gotham,
-                BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,
-                Position=UDim2.fromOffset(14,42),Size=UDim2.new(1,-28,0,32),ZIndex=41},panel)
-            local url=create("TextBox",{Name="Invite",Text=invite,TextSize=12,Font=Enum.Font.Gotham,
-                ClearTextOnFocus=false,TextEditable=false,TextXAlignment=Enum.TextXAlignment.Center,
-                BorderSizePixel=0,Position=UDim2.fromOffset(14,82),Size=UDim2.new(1,-28,0,28),ZIndex=41},panel)
-            round(url,6)
-            local join=create("TextButton",{Name="JoinServer",Text="Join Server",TextSize=13,
-                Font=Enum.Font.GothamSemibold,TextColor3=white,BackgroundColor3=accent,AutoButtonColor=true,
-                BorderSizePixel=0,Position=UDim2.fromOffset(14,124),Size=UDim2.new(1,-28,0,36),ZIndex=41},panel)
-            round(join,8)
-            local function reset()
-                join.Text="Join Server"
-                description.Text="Get updates and support from the community."
-            end
-            local function theme()
-                panel.BackgroundColor3=SelectedTheme.ElementBackground or SelectedTheme.Background
-                stroke.Color=SelectedTheme.ElementStroke
-                title.TextColor3=SelectedTheme.TextColor;close.TextColor3=SelectedTheme.TextColor
-                description.TextColor3=SelectedTheme.TextColor;description.TextTransparency=.2
-                url.TextColor3=SelectedTheme.TextColor
-                url.BackgroundColor3=SelectedTheme.Background
-            end
-            local function refresh()
-                local available=not rayfieldDestroyed and Rayfield.Enabled and Main.Visible and TabList.Visible
-                    and not Hidden and not Minimised and not searchOpen and Main.Size.Y.Offset>160
-                button.Visible=available
-                if not available then panel.Visible=false end
-            end
-            local function copyInvite()
-                local candidates={}
-                local function add(fn) if type(fn)=="function" then candidates[#candidates+1]=fn end end
-                add(setclipboard);add(toclipboard)
-                if type(syn)=="table" then add(syn.write_clipboard) end
-                if type(getgenv)=="function" then
-                    local ok,environment=pcall(getgenv)
-                    if ok and type(environment)=="table" then
-                        add(environment.setclipboard);add(environment.toclipboard)
-                        if type(environment.syn)=="table" then add(environment.syn.write_clipboard) end
-                    end
-                end
-                for _,copy in ipairs(candidates) do
-                    local ok,result=pcall(copy,invite)
-                    if ok and result~=false then return true end
-                end
-                return false
-            end
-            watch(button.Activated,function()
-                refresh()
-                if button.Visible then reset();panel.Visible=not panel.Visible end
-            end)
-            watch(close.Activated,function() panel.Visible=false end)
-            watch(join.Activated,function()
-                refresh()
-                if not button.Visible or not panel.Visible then return end
-                if copyInvite() then
-                    join.Text="Link Copied"
-                    description.Text="Invite link copied. Paste it in Discord to join."
-                else
-                    join.Text="Copy Invite"
-                    description.Text="Clipboard unavailable. Select and copy the invite below."
-                end
-            end)
-            watch(url.Focused,function() url.SelectionStart=1;url.CursorPosition=#invite+1 end)
-            for _,entry in ipairs({{Rayfield,"Enabled"},{Main,"Visible"},{Main,"Size"},
-                {TabList,"Visible"},{Main.Search,"Visible"},{Main.Search.Input,"Interactable"}}) do
-                watch(entry[1]:GetPropertyChangedSignal(entry[2]),refresh)
-            end
-            watch(Main:GetPropertyChangedSignal("BackgroundColor3"),theme)
-            Rayfield.Destroying:Connect(function()
-                for _,connection in ipairs(links) do connection:Disconnect() end
-            end)
-            reset();theme();refresh()
-        end
-    end
 
 	return Window
 end
@@ -15451,107 +15419,18 @@ return RayfieldLibrary
     assert(type(library)=="table" and type(library.CreateWindow)=="function","Rayfield could not be loaded.")
     local defaultScale=Input.TouchEnabled and 75 or 100
     local ui={library=library,updating=false,ready=false,query="",page=1,pageSize=80,rows={},byId={},options={},
-        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,configStatus="No saved configuration."}
+        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,configStatus="No saved configuration."}
     rayfieldUI=ui
-        -- Local nameplate visibility only; the game's player identity stays intact.
-    do
-        local enabled,destroyed,pending=false,false,false
-        local active,addedConnection
-        local function isGui(object,class)
-            local ok,result=pcall(function() return object:IsA(class or "GuiObject") end)
-            return ok and result
-        end
-        local function localTag()
-            local gui=playerGui:FindFirstChild("GameGui")
-            local world=gui and gui:FindFirstChild("World")
-            local camera=world and world:FindFirstChild("Camera")
-            local tag=camera and camera:FindFirstChild("NameTag")
-            return isGui(tag,"Frame") and tag or nil
-        end
-        local function nameFrame(tag)
-            if not tag then return nil end
-            local found
-            local values=binding and type(binding.renderer)=="function" and upvalues(binding.renderer)
-            for _,value in pairs(values or {}) do
-                if type(value)=="table" and type(rawget(value,"redraw"))=="function" then
-                    local frame=rawget(value,"frame")
-                    if isGui(frame) and read(frame,"Parent")==tag and frame.Name~="Flag" and frame.Name~="Wrench" then
-                        if found and found~=frame then return nil end
-                        found=frame
-                    end
-                end
-            end
-            if found then return found end
-            -- The native container holds one bitmap text frame, Flag and Wrench.
-            -- If the structure is ambiguous, leave it intact until it is known.
-            for _,child in ipairs(tag:GetChildren()) do
-                if isGui(child,"Frame") and child.Name~="Flag" and child.Name~="Wrench" then
-                    if found then return nil end
-                    found=child
-                end
-            end
-            return found
-        end
-        local function release()
-            local previous=active;active=nil
-            if not previous then return end
-            for _,connection in ipairs(previous.connections) do connection:Disconnect() end
-            pcall(function() previous.frame.Visible=previous.visible end)
-        end
-        local function refresh()
-            if not enabled or destroyed then return end
-            local tag=localTag()
-            local frame=nameFrame(tag)
-            if active and active.frame~=frame then release() end
-            if not frame or active then return end
-            local saved={frame=frame,visible=frame.Visible,connections={}}
-            active=saved
-            saved.connections[#saved.connections+1]=frame:GetPropertyChangedSignal("Visible"):Connect(function()
-                if enabled and active==saved and frame.Visible then frame.Visible=false end
-            end)
-            saved.connections[#saved.connections+1]=frame:GetPropertyChangedSignal("Parent"):Connect(refresh)
-            frame.Visible=false
-        end
-        local function queueRefresh(object)
-            if not enabled or destroyed or pending then return end
-            local parent=read(object,"Parent")
-            if object.Name~="GameGui" and object.Name~="World" and object.Name~="Camera" and object.Name~="NameTag"
-                and not (parent and parent.Name=="NameTag") then return end
-            pending=true
-            local function run()
-                pending=false;refresh()
-            end
-            if type(task.defer)=="function" then task.defer(run) else run() end
-        end
-        local function set(value)
-            if destroyed then return end
-            enabled=value==true
-            if not enabled then
-                if addedConnection then addedConnection:Disconnect();addedConnection=nil end
-                release();return
-            end
-            if not addedConnection then
-                addedConnection=playerGui.DescendantAdded:Connect(queueRefresh)
-            end
-            refresh()
-        end
-        ui.usernamePrivacy={Set=set,Refresh=refresh,Destroy=function()
-            set(false);destroyed=true
-        end}
-    end
-
     ui.Destroy=function()
         ui.ready=false
-        ui.usernamePrivacy.Destroy()
         if type(library.Destroy)=="function" then library:Destroy() end
     end
-    ui.logoAsset=genhubLogoAsset()
     local window=library:CreateWindow({Name="GenHub 1.9.2",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
-        LoadingVersion="GenHub 1.9.2",BrandingImage=ui.logoAsset,CommunityInvite="https://discord.gg/jZ4xTfbg5J",
         Theme="Ocean",Icon=0,ToggleUIKeybind=Enum.KeyCode.RightControl,
         DisableRayfieldPrompts=true,DisableBuildWarnings=true,
         ConfigurationSaving={Enabled=false,FileName="PNB_Farmable"},Discord={Enabled=false},KeySystem=false})
     local main=window:CreateTab("Farm",0)
+    local pnbTab=window:CreateTab("PNB",0)
     local settingsTab=window:CreateTab("Settings",0)
     local statusTab=window:CreateTab("Status",0)
     local reference={}
@@ -15610,7 +15489,9 @@ return RayfieldLibrary
     main:CreateButton({Name="Next Page",Callback=function() ui.page=math.min(ui.pages or 1,ui.page+1);ui.Search() end})
     local selectedTarget=main:CreateParagraph({Title="Selected Target",Content="Select a block above. Its seed is selected automatically."})
     local cycleToggle=main:CreateToggle({Name="Start Farm",CurrentValue=false,Callback=function(value)
-        if ui.updating or value==(autoLoop~=nil) then return end
+        local farmOn=autoLoop~=nil and not autoLoop.pnbOnly
+        if ui.updating or value==farmOn then return end
+        if autoLoop and autoLoop.pnbOnly then notify("Stop PNB (PNB tab) before starting the farm cycle.");ui.Sync(true);return end
         dispatch("AutoCycle")
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
@@ -15641,20 +15522,19 @@ return RayfieldLibrary
         for _,key in ipairs({"soundEffects","handAnimations","blockEffects"}) do
             if data[key]~=nil and type(data[key])~="boolean" then return nil,"Effect settings must be on or off." end
         end
-        if data.hideUsername~=nil and type(data.hideUsername)~="boolean" then return nil,"Hide Username must be on or off." end
         local scale=data.uiScale==nil and defaultScale or data.uiScale
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
-        return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
-            soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
-            hideUsername=data.hideUsername==true}
+        local pnbId=integer(data.pnbId) and data.pnbId>0 and data.pnbId or nil
+        return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,pnbId=pnbId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
+            soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale}
     end
     local function currentConfig()
-        return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),hits=tonumber(hitsInput.Text),
+        return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),pnbId=ui.pnbId,hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
-            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername})
+            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale})
     end
-    local function settingInput(title,control,hint)
-        local widget=settingsTab:CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
+    local function settingInput(title,control,hint,tab)
+        local widget=(tab or settingsTab):CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
             Callback=function(value)
                 if ui.updating then return end
                 if busy() then notify("Stop the cycle before changing settings.");ui.Sync(true);return end
@@ -15666,11 +15546,6 @@ return RayfieldLibrary
         table.insert(inputMirrors,{widget=widget,control=control})
     end
     settingsTab:CreateSection("Interface")
-    local privacyToggle=settingsTab:CreateToggle({Name="Hide Username",CurrentValue=false,Callback=function(value)
-        if ui.updating then return end
-        ui.hideUsername=value==true;ui.usernamePrivacy.Set(ui.hideUsername)
-        ui.Sync(true)
-    end})
     local scaleInfo=settingsTab:CreateParagraph({Title="Window Size",Content="Drag the bottom-right corner to resize the window."})
     local function syncScaleInfo()
         paragraph(scaleInfo,"Window Size",string.format("Preferred: %.0f%% | On screen: %.0f%%\nDrag the bottom-right corner to resize. Save Config remembers your size.",ui.uiScale,library:GetUIScale()))
@@ -15702,6 +15577,93 @@ return RayfieldLibrary
     settingInput("Action Delay (seconds)",delayInput,"0.05–5")
     settingInput("Collect Radius (tiles)",rangeInput,"0.5–20")
     settingInput("Collect Filter",filterInput,"ALL or comma-separated item IDs")
+    -- BEGIN PNB TAB: runs the Farm cycle's proven PNB stage on its own (pnbOnly):
+    -- no planting, no harvesting. Same home selection, startup break, drop guard,
+    -- recovery and seed storage as Start Farm.
+    local function pnbBlockInfo(id)
+        if not integer(id) or id<=0 then return nil,"Enter a whole-number Block ID." end
+        local def=ui.db and entry(ui.db,id)
+        if ui.db and type(def)~="table" then return nil,"Block ID "..id.." does not exist in this game." end
+        if type(def)=="table" and rawget(def,"kind")=="seed" then return nil,"Item "..id.." is a seed. Enter the block ID instead." end
+        if ui.db and not pair(ui.db,id) then return nil,"Block "..id.." has no seed pair (ID+1) in this game; the PNB cycle tracks seeds." end
+        return nativeName(ui.db,id,reference[id])
+    end
+    -- Runs a panel action. AutoCycle reads the Item ID box, so it is borrowed for the
+    -- call and restored; the Farm tab's target is never changed.
+    local function runAction(name,idOverride)
+        local action=uiActions[name]
+        if not action then return end
+        local saved=idInput.Text
+        if idOverride then idInput.Text=tostring(idOverride) end
+        local ok,why=pcall(action)
+        idInput.Text=saved
+        if not ok then halt("UI action failed: "..tostring(why)) end
+    end
+    local function pnbActive() return autoLoop~=nil and autoLoop.pnbOnly==true end
+    local pnbInput=pnbTab:CreateInput({Name="ID Block",CurrentValue="",PlaceholderText="Item ID of the block to place & break",
+        RemoveTextAfterFocusLost=false,Callback=function(value)
+            if ui.updating then return end
+            if busy() then notify("Stop PNB before changing the Block ID.");ui.Sync(true);return end
+            local text=tostring(value):match("^%s*(.-)%s*$")
+            if text=="" then ui.pnbId=nil;ui.Sync(true);return end
+            local id=tonumber(text)
+            local name,why=pnbBlockInfo(id)
+            if not name then notify(why);ui.Sync(true);return end
+            ui.pnbId=id
+            log(string.format("PNB Block: %s [%d].",name,id))
+            ui.Sync(true);report(true)
+        end})
+    local pnbToggle=pnbTab:CreateToggle({Name="Start PNB",CurrentValue=false,Callback=function(value)
+        if ui.updating or value==pnbActive() then return end
+        if value then
+            if autoLoop or farm then notify("Turn off Start Farm / Auto Farm before using PNB.");ui.Sync(true);return end
+            if not ui.pnbId then notify("Enter a Block ID first.");ui.Sync(true);return end
+            CONFIG.pnbOnly=true
+            runAction("AutoCycle",ui.pnbId)
+            CONFIG.pnbOnly=false
+            if not autoLoop then notify(tostring(result)) end
+        else
+            runAction("Stop")
+        end
+        report(true);ui.Sync(true)
+    end})
+    local pnbInfo=pnbTab:CreateParagraph({Title="PNB Status",Content="Enter a Block ID above."})
+    pnbTab:CreateSection("Options")
+    settingInput("Hits per Block",hitsInput,"1–50",pnbTab)
+    settingInput("Action Delay (seconds)",delayInput,"0.05–5",pnbTab)
+    pnbTab:CreateParagraph({Title="How PNB Works",Content="Runs the same Place & Break stage as Start Farm, on its own: it places the block, breaks it, and collects every drop, over and over. It never plants or harvests, and it stops when the block runs out. At 200 seeds it stores 100 in Display Box 1422, like the farm cycle. The block needs a seed pair (ID+1). Turn Start PNB off, or press H, to stop."})
+    function ui.SyncPNB()
+        local a=autoLoop and autoLoop.pnbOnly and autoLoop or nil
+        local shown=a and a.block or ui.pnbId
+        local names={PNB="Place & Break",CEK="Checking Inventory",SETOR="Storing Seeds",JEDA="Recovering"}
+        local lines={}
+        if shown then
+            local name=pnbBlockInfo(shown)
+            local count=binding and inventoryNumber(binding,"count",shown)
+            table.insert(lines,clean(name or ("Item #"..shown)).." ["..shown.."]")
+            table.insert(lines,"In backpack: "..(count and tostring(count) or "—"))
+        else
+            table.insert(lines,"Enter a Block ID above.")
+        end
+        if a then
+            table.insert(lines,"PNB: "..(names[a.stage] or "Checking").." • Cycles: "..cycles)
+            table.insert(lines,"Blocks: "..tostring(a.blocks or "—").." • Seeds: "..tostring(a.seeds or "—").." • Storage transfers: "..tostring(a.deposits or 0))
+            table.insert(lines,clean(tostring(ui.activity or "")))
+        else
+            table.insert(lines,"PNB: "..(autoLoop and "Start Farm is running" or "Stopped"))
+            table.insert(lines,clean(tostring(result):sub(1,200)))
+        end
+        paragraph(pnbInfo,"PNB Status",table.concat(lines,"\n"))
+        ui.updating=true
+        local ok,why=pcall(function()
+            local text=ui.pnbId and tostring(ui.pnbId) or ""
+            if pnbInput.CurrentValue~=text then pnbInput:Set(text) end
+            if pnbToggle.CurrentValue~=pnbActive() then pnbToggle:Set(pnbActive()) end
+        end)
+        ui.updating=false
+        if not ok then adapterStatus="PNB tab sync: "..tostring(why):sub(1,160) end
+    end
+    -- END PNB TAB
     settingsTab:CreateSection("PNB Effects")
     local effectMirrors={}
     for _,setting in ipairs({{name="Sound Effects",key="sounds"},{name="Hand Animations",key="hands"},{name="Block Break Effects",key="blocks"}}) do
@@ -15746,7 +15708,7 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
-    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, effects, UI size, and Hide Username preference. Auto Load restores them next time. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
+    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, effects, and preferred UI size. Auto Load restores them next time. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
         local b=bind(false)
@@ -15809,7 +15771,6 @@ return RayfieldLibrary
     function ui.Sync(force)
         if not ui.ready or not alive or not force and os.clock()-ui.lastSync<.5 then return end
         ui.lastSync=os.clock()
-        if ui.hideUsername then ui.usernamePrivacy.Refresh() end
         if binding and binding.itemDB~=ui.db then ui.Rebuild();ui.Search() end
         local row=ui.byId[tonumber(idInput.Text)];ui.selected=row
         local text=row and (clean(row.name).." ["..row.id.."]\nSeed: "..clean(row.seedName).." ["..(row.id+1).."]") or "Select an available block above."
@@ -15822,6 +15783,7 @@ return RayfieldLibrary
             activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
                 or autoLoop.paused and "Waiting for the server. The cycle will resume automatically."
+                or autoLoop.hop and "Moving to a nearby tile to collect leftover blocks or seeds."
                 or farm and farm.stepRejected and "The game returned a supported step. Waiting here without switching sides."
                 or farm and farm.action and "Waiting for action confirmation."
                 or farm and farm.motion and "Moving to the next tile."
@@ -15832,10 +15794,11 @@ return RayfieldLibrary
         end
         if pickupGate and (running or autoLoop and autoLoop.stage=="PNB") then activity=pickupGate.reason end
         if pending and pending.protectCell then activity="Collecting and verifying drops before PNB continues." end
+        ui.activity=activity
         paragraph(summary,"Farm Status",stage..stock.."\n"..activity)
         local status={"GenHub 1.9.2 | Game version "..tostring(read(game,"PlaceVersion") or "—"),
             "World: "..clean(world or "Unavailable")..(x and string.format(" | Position: %.2f, %.2f",x,y) or ""),
-            "Start Farm: "..(autoLoop and "On" or "Off").." | Stage: "..stage,
+            "Start Farm: "..(autoLoop and not autoLoop.pnbOnly and "On" or "Off").." | Stage: "..stage,
             "Target: "..(row and clean(row.name).." ["..row.id.."] | Seed: "..(row.id+1) or "Not selected"),
             "PNB: "..(running and "On" or "Off").." | Completed cycles: "..cycles,
             "Auto Collect: "..(collecting and "On" or "Off")..string.format(" | Radius: %.2f tiles | Filter: %s",collectRange,clean(filterText)),
@@ -15868,11 +15831,12 @@ return RayfieldLibrary
         paragraph(detail,"Full Status",table.concat(status,"\n"))
         paragraph(configInfo,"Configuration Status",ui.configStatus)
         syncScaleInfo()
+        if ui.SyncPNB then ui.SyncPNB() end
         ui.updating=true
         if scaleSlider.CurrentValue~=ui.uiScale then scaleSlider:Set(ui.uiScale) end
-        if privacyToggle.CurrentValue~=ui.hideUsername then privacyToggle:Set(ui.hideUsername) end
         if row and dropdown.CurrentOption[1]~=row.label then dropdown:Set({row.label}) end
-        if cycleToggle.CurrentValue~=(autoLoop~=nil) then cycleToggle:Set(autoLoop~=nil) end
+        local farmOn=autoLoop~=nil and not autoLoop.pnbOnly
+        if cycleToggle.CurrentValue~=farmOn then cycleToggle:Set(farmOn) end
         if autoLoadToggle.CurrentValue~=ui.autoLoad then autoLoadToggle:Set(ui.autoLoad) end
         for _,item in ipairs(effectMirrors) do if item.widget.CurrentValue~=effects[item.key] then item.widget:Set(effects[item.key]) end end
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
@@ -15895,9 +15859,9 @@ return RayfieldLibrary
                 if valid.autoLoad and ui.Select(valid.targetId) then
                     hitsInput.Text=tostring(valid.hits);delayInput.Text=tostring(valid.delay==.15 and CONFIG.interval or valid.delay)
                     rangeInput.Text=tostring(valid.range);filterInput.Text=valid.collectFilter
+                    if valid.pnbId then ui.pnbId=valid.pnbId end
                     effects.sounds,effects.hands,effects.blocks=valid.soundEffects,valid.handAnimations,valid.blockEffects
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
-                    ui.hideUsername=valid.hideUsername;ui.usernamePrivacy.Set(ui.hideUsername)
                     ui.configStatus="Saved configuration loaded. Ready to start."
                 else ui.configStatus="Auto Load is disabled. Default settings are in use." end
             else ui.configStatus=why.." Default settings are in use." end
@@ -15909,7 +15873,7 @@ return RayfieldLibrary
     library:SetUIScale(ui.uiScale);ui.Sync(true);panel.Visible=false
     log(string.format("GenHub ready; %d farmable blocks.",ui.availableCount))
     if type(writefile)=="function" then
-        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 13\nLogo: "..(ui.logoAsset and "Original GenHub PNG" or "GenHub text fallback").."\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
+        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 12\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
             ui.referenceCount,ui.availableCount,ui.selected and (ui.selected.name.." ["..ui.selected.id.."]") or "Not selected",tostring(ui.autoLoad),tostring(ui.uiScale),ui.configStatus))
     end
 end
