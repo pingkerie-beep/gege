@@ -44,6 +44,9 @@ local blockVisual=nil
 local farm,stopFarm=nil,nil
 local autoLoop,recoverLoop=nil,nil -- Distinct from `cycle`, one place/break operation.
 local worldReturn={}
+-- Random-world PNB (GenHub 1.9.3). State is shared by the cycle code and the Rayfield UI.
+local rp={enabled=false,farmWorld=nil,phase="farm",visitFails=0,cooldownUntil=0,keepOn=false,
+    warp=nil,save=nil,shutdown=false}
 local rayfieldUI=nil
 local uiActions={}
 local generation,currentWorld,lastBind=0,nil,-math.huge
@@ -385,16 +388,26 @@ local function bind(force)
     return b
 end
 local function livePosition(b)
-    if not b then return nil end
+    -- FIX: setiap penolakan mencatat alasannya (worldReturn.liveWhy) agar terlihat di status.
+    local function fail(why) worldReturn.liveWhy=why;return nil end
+    if not b then return fail("binding kosong") end
     local x,y,world,hp=positionSnapshot(b)
-    local values=b and upvalues(b.positionFn)
-    if not x or not values or not finite(values[1]) or not finite(values[2]) then return nil end
-    if math.abs(values[1]-x)>.5 or math.abs(values[2]-y)>.5 then return nil end
+    if not x then return fail("posisi Debug/native tidak terbaca") end
+    local values=upvalues(b.positionFn)
+    if not values or not finite(values[1]) or not finite(values[2]) then return fail("posisi positionFn tidak terbaca") end
+    if math.abs(values[1]-x)>.5 or math.abs(values[2]-y)>.5 then
+        return fail(string.format("posisi Debug %.2f,%.2f beda dengan native %.2f,%.2f",x,y,values[1],values[2]))
+    end
     local s=nativeStateSnapshot(b)
-    if rawget(b.state,"ghost")==true or rawget(b.state,"dead")==true
-        or b.stateGetter and (not s or s.active~=true or s.dead~=false
-            or math.abs(s.x-values[1])>.5 or math.abs(s.y-values[2])>.5)
-        or not b.stateGetter and hp and hp<=0 then return nil end
+    if rawget(b.state,"ghost")==true then return fail("state ghost aktif") end
+    if rawget(b.state,"dead")==true then return fail("karakter mati") end
+    if b.stateGetter then
+        if not s then return fail("state native tidak terbaca") end
+        if s.active~=true then return fail("karakter belum aktif") end
+        if s.dead~=false then return fail("karakter masih mati") end
+        if math.abs(s.x-values[1])>.5 or math.abs(s.y-values[2])>.5 then return fail("posisi state native beda") end
+    elseif hp and hp<=0 then return fail("hp<=0") end
+    worldReturn.liveWhy=nil
     return values[1],values[2],world
 end
 local function inventoryNumber(b,method,id)
@@ -694,6 +707,11 @@ local function halt(reason,manual)
     pickupGate=nil
     clearPNBAnimation()
     autoLoop=nil;loopButton.Text="Siklus otomatis: OFF"
+    rp.warp=nil;rp.keepOn=false
+    if rp.phase=="visit" and not rp.shutdown then
+        rp.phase="farm";rp.visitFails=0
+        if rp.save then pcall(rp.save) end -- stop manual: jangan lanjut ke world random saat load berikutnya
+    end
     stopFarm()
     running,collecting=false,false;cycle,anchor,settings=nil,nil,nil
     generation+=1;pending=nil
@@ -743,7 +761,7 @@ local function canStart()
     local b=bind(true)
     if not b then return nil,adapterStatus end
     local x,y,world=livePosition(b)
-    if not x then return nil,"Posisi aktif/mati/ghost belum cocok." end
+    if not x then return nil,"Posisi aktif/mati/ghost belum cocok ["..tostring(worldReturn.liveWhy).."]." end
     return b,x,y,world
 end
 local function rpcFor(b,name)
@@ -766,9 +784,16 @@ local function request(p,remote,...)
             if type(remote)=="function" then return remote(table.unpack(args,1,args.n)) end
             return remote:InvokeServer(table.unpack(args,1,args.n))
         end))
-        job.done=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
+        job.done=true
+        if not job.released then job.released=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1) end
     end)
     return job
+end
+-- FIX: lepas paksa request yang menggantung (server tidak menjawab setelah rejoin).
+function worldReturn.releaseJob(job)
+    if job and not job.done and not job.released then
+        job.released=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
+    end
 end
 local function measure(reply,id)
     if not reply or not reply[1] or reply.n~=2 then return nil end
@@ -3091,6 +3116,7 @@ local function loopTick()
     if not collecting then halt("Kolek tidak aktif; siklus dihentikan agar hasil farm tidak tertinggal.");return end
     local x,y,world=livePosition(a.native.b)
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
+    if rp.warp then farmNote="Warp ke "..rp.warp.target.." ...";return end
     if a.deposit then depositTick(a,x,y);return end
     if a.hop then CONFIG.hopStep(a,x,y);return end
     if a.blockedHome then
@@ -3119,10 +3145,12 @@ local function loopTick()
     if os.clock()>=a.nextCheck then
         request(a,rpcFor(a.native.b,"GetInventory"));return
     end
+    if rp.shouldDepart(a,world) then rp.depart(a);return end
     if a.blocks>=200 and a.stage~="PNB" then
         a.home={x=x,y=y,tx=math.floor(x),ty=math.floor(y-.475)-1};a.prepare=true;a.settle=nil
         loopStage(a,"PNB");log("STOK BLOK 200: hentikan harvest berikutnya, prioritaskan PNB.")
     end
+    if a.visit and a.seeds>=200 then rp.leaveVisit(a,"seed 200 tercapai (setor di world farm)",false);return end
     if a.seeds>=200 then
         if os.clock()<(a.nextDepositAt or 0) then farmNote="Menunggu box siap; siklus tetap ON.";return end
         if a.stage~="SETOR" then a.depositResume=a.stage end
@@ -3130,7 +3158,7 @@ local function loopTick()
     end
     if a.stage=="CEK" then
         if a.blocks>0 or a.prepare and farmTile(a.native,a.home.tx,a.home.ty,a.layer)==a.block then loopStage(a,"PNB")
-        elseif a.pnbOnly then halt("Out of blocks; PNB finished.",true);report(true);return
+        elseif a.pnbOnly then if a.visit then rp.leaveVisit(a,"blok habis",false) else halt("Out of blocks; PNB finished.",true);report(true) end;return
         else loopStage(a,a.seeds>0 and "TANAM" or "PANEN") end
     end
     if a.stage=="PNB" then
@@ -3161,7 +3189,7 @@ local function loopTick()
                 log("BREAK AWAL: menyelaraskan petak PNB melalui hit native sebelum mulai tanam.")
                 startupBreak(a,x,y);return
             end
-            if a.pnbOnly then halt("Out of blocks; PNB finished.",true);report(true);return end
+            if a.pnbOnly then if a.visit then rp.leaveVisit(a,"blok habis",false) else halt("Out of blocks; PNB finished.",true);report(true) end;return end
             loopStage(a,"TANAM");return
         end
         if os.clock()-(a.progressAt or os.clock())>15 then
@@ -3259,12 +3287,26 @@ recoverLoop=function()
     local a=autoLoop;local p=a and a.paused
     if not p or os.clock()<p.retryAt then return end
     if a.rejoin then return end
+    -- FIX: watchdog. Request GetInventory yang tidak dijawab dulu membuat siklus macet selamanya.
+    if p.job and not p.job.done and os.clock()-p.job.started>=CONFIG.rpcTimeout+3 then
+        worldReturn.releaseJob(p.job);p.job=nil;p.session=false;p.snapshotStarted,p.nextSnapshot=nil,nil
+        p.retryAt=os.clock()+1;binding=nil
+        farmNote="JEDA: server belum menjawab; state & inventory dibaca ulang dari awal."
+        log(farmNote);return
+    end
+    if (lease.outstanding or 0)>0 and not (p.job and not p.job.done) then
+        p.leaseSince=p.leaseSince or os.clock()
+        if os.clock()-p.leaseSince>=15 then
+            lease.outstanding=0;p.leaseSince=nil
+            log("JEDA: permintaan server lama tidak selesai; dilepas paksa lalu dicoba ulang.")
+        end
+    else p.leaseSince=nil end
     if (lease.outstanding or 0)>0 then farmNote="JEDA: menunggu permintaan server lama selesai; siklus tetap ON.";return end
     if not p.session then
         p.retryAt=os.clock()+2
         local b,x,y,world=canStart()
         if not b then farmNote="JEDA: "..tostring(x).."; akan diperiksa ulang.";return end
-        if a.pinnedWorld and world~=a.pinnedWorld then
+        if a.pinnedWorld and tostring(world):upper()~=tostring(a.pinnedWorld):upper() then
             farmNote="Waiting for farm world "..a.pinnedWorld..". Farming will not run in another world.";return
         end
         if a.deposit and a.deposit.phase~="before" and world~=(a.deposit.world or a.world) then
@@ -3485,7 +3527,11 @@ do
                     a.home=nil;a.badHomes=nil;a.prep=nil;a.prepare=true;a.settle=nil
                     binding=nil;currentWorld=world
                     if farm then farm.motion,farm.target,farm.scan=nil,nil,nil;farm.pathSearch=nil;farm.candidates={} end
-                    if a.paused then a.paused.session=false;a.paused.job=nil;a.paused.retryAt=0 end
+                    if a.paused then
+                        worldReturn.releaseJob(a.paused.job)
+                        a.paused.session=false;a.paused.job=nil;a.paused.retryAt=0
+                    end
+                    a.resumeStage="CEK";a.nativeWorldSeen=true -- FIX: scan ulang inventory/tile sebelum lanjut
                     traceMotion("WORLD RETURN ready "..r.world)
                     log("Returned to "..r.world.."; refreshing game state and server inventory before farming.")
                     return false
@@ -3526,6 +3572,181 @@ do
             lease.outstanding=math.max(0,(lease.outstanding or 0)-1)
         end)
         return true
+    end
+
+    -- ===== Random-world PNB =====
+    rp.name=name
+    function rp.randomName()
+        -- Seed dari GUID unik + waktu (math.randomseed sering sama di tiap execute ulang).
+        local entropy=os.time()+os.clock()*1000003
+        local ok,guid=pcall(function() return game:GetService("HttpService"):GenerateGUID(false) end)
+        if ok and type(guid)=="string" then
+            for i=1,#guid do entropy=(entropy*31+guid:byte(i))%2147483629 end
+        end
+        local r=Random.new(math.floor(entropy))
+        local n
+        for _=1,20 do
+            local t={}
+            for i=1,r:NextInteger(6,7) do t[i]=string.char(64+r:NextInteger(1,26)) end
+            n=table.concat(t)
+            if n~=rp.lastWorld and n~=rp.farmWorld then break end
+        end
+        rp.lastWorld=n
+        return n
+    end
+    -- Lock ids: known ids + every item whose name ends with "Lock" (not "Lock of ...").
+    function rp.lockIds(b)
+        local ids={[202]=true,[204]=true,[206]=true,[242]=true,[1796]=true,[2408]=true}
+        local n=0
+        for id,def in next,b.itemDB or {} do
+            n+=1;if n>30000 then break end
+            if type(id)=="number" and type(def)=="table" then
+                local nm=rawget(def,"name")
+                if type(nm)=="string" and nm:find("%f[%a]Lock$") then ids[id]=true end
+            end
+        end
+        return ids
+    end
+    function rp.findLock(b)
+        local ids=rp.lockIds(b)
+        local w,h,fg=rawget(b.state,"w"),rawget(b.state,"h"),rawget(b.state,"fg")
+        if not integer(w) or not integer(h) or type(fg)~="table" then return nil end
+        for y=0,h-1 do
+            local row=rawget(fg,y)
+            if type(row)=="table" then
+                for x=0,w-1 do
+                    local id=rawget(row,x)
+                    if id and ids[id] then return id,x,y end
+                end
+            end
+        end
+        return nil
+    end
+    local function chatCandidates()
+        local gui=playerGui:FindFirstChild("GameGui")
+        local best,all={},{}
+        if not gui then return best,all end
+        for _,d in ipairs(gui:GetDescendants()) do
+            if d:IsA("TextBox") then
+                local full=d:GetFullName()
+                local low=full:lower()
+                local ph=tostring(read(d,"PlaceholderText") or "")
+                local lp=ph:lower()
+                table.insert(all,string.format("%s | placeholder=%s | visible=%s",full,ph,tostring(read(d,"Visible"))))
+                if not low:find("worldpicker") and (low:find("chat") or lp:find("chat") or lp:find("say") or lp:find("message")) then
+                    table.insert(best,d)
+                end
+            end
+        end
+        table.sort(best,function(a,b) return (read(a,"Visible")==true and 0 or 1)<(read(b,"Visible")==true and 0 or 1) end)
+        return best,all
+    end
+    local function dumpWarp(all,extra)
+        if type(writefile)~="function" then return end
+        local lines={"PNB RandomWorld diag | game v"..tostring(read(game,"PlaceVersion") or "?"),tostring(extra or ""),"TextBox di GameGui:"}
+        for _,l in ipairs(all) do table.insert(lines,l) end
+        table.insert(lines,"WorldRemotes:")
+        for _,c in ipairs(remotes:GetChildren()) do table.insert(lines,c.ClassName.." "..c.Name) end
+        pcall(writefile,"PNBRange_Warp.txt",table.concat(lines,"\n"))
+    end
+    local function sendChat(text,viaSignal)
+        local best,all=chatCandidates()
+        if #best==0 then dumpWarp(all,"Tidak ada TextBox chat yang cocok.");return false,"TextBox chat tidak ditemukan" end
+        local box=best[1]
+        dumpWarp(all,"Chat box dipakai: "..box:GetFullName())
+        task.spawn(function()
+            pcall(function()
+                if viaSignal and type(firesignal)=="function" then
+                    box.Text=text;firesignal(box.FocusLost,true)
+                else
+                    box:CaptureFocus();task.wait(.15);box.Text=text;task.wait(.15);box:ReleaseFocus(true)
+                end
+            end)
+        end)
+        return true
+    end
+    local function sendEnter(target)
+        local b=binding or bind(false)
+        local enter=b and menuEntry(b)
+        if not enter then return false,"WorldMenu.enter belum terverifikasi" end
+        lease.outstanding=(lease.outstanding or 0)+1
+        task.spawn(function()
+            pcall(enter,target)
+            lease.outstanding=math.max(0,(lease.outstanding or 0)-1)
+        end)
+        return true
+    end
+    function rp.beginWarp(target,why,returning,origin)
+        target=name(target or "")
+        if not target then log("Warp dibatalkan: nama world tidak valid.");return false end
+        rp.warp={target=target,why=why,returning=returning==true,origin=origin or "farm",tries=0,nextAt=os.clock()+.5}
+        rp.keepOn=true
+        farmNote="Warp ke "..target.." ("..tostring(why)..")."
+        log(farmNote);traceMotion("WARP "..target.." "..tostring(why))
+        if rp.save then pcall(rp.save) end
+        return true
+    end
+    local methods={"chat","chatsignal","enter"}
+    function rp.warpTick()
+        local w=rp.warp
+        if not w then return end
+        local _,_,world=positionSnapshot()
+        if world and name(world)==w.target then rp.warp=nil;rp.keepOn=false;return end
+        if os.clock()<w.nextAt then return end
+        w.tries+=1
+        local method=methods[(w.tries-1)%#methods+1]
+        local ok,why
+        if method=="enter" then ok,why=sendEnter(w.target)
+        else ok,why=sendChat("/warp "..w.target,method=="chatsignal") end
+        w.nextAt=os.clock()+(ok and 10 or 3)
+        log(string.format("Warp %s via %s (percobaan %d): %s",w.target,method,w.tries,ok and "terkirim" or tostring(why)))
+        if not w.returning and w.tries>=6 then
+            rp.warp=nil
+            if w.origin=="visit" then
+                rp.phase="farm";rp.visitFails=0
+                rp.beginWarp(rp.farmWorld,"warp ke world random gagal; kembali ke farm",true,"visit")
+            else
+                rp.phase="farm";rp.cooldownUntil=os.time()+300;rp.keepOn=false
+                if rp.save then pcall(rp.save) end
+                log("Warp gagal 6x; PNB lokal dipakai 5 menit. Lihat PNBRange_Warp.txt.")
+            end
+        end
+    end
+    function rp.shouldDepart(a,world)
+        if not rp.enabled or a.visit or a.warp or a.pnbOnly or rp.warp then return false end
+        if not rp.farmWorld or name(world)~=name(rp.farmWorld) then return false end
+        if os.time()<(rp.cooldownUntil or 0) then return false end
+        if (a.blocks or 0)<=0 or (a.seeds or 0)>=200 or a.deposit then return false end
+        if a.stage=="CEK" then return true end
+        if (a.blocks or 0)>=200 and (a.stage=="TANAM" or a.stage=="PANEN" or a.stage=="TUNGGU") then return true end
+        return a.stage=="PNB" and not running and not pending and not a.prep and not a.hop
+            and not a.heldPNB and not pickupGate
+    end
+    function rp.depart(a)
+        rp.phase="visit";rp.visitFails=0
+        rp.beginWarp(rp.randomName(),"PNB di world random ("..tostring(a.blocks).." blok)",false,"farm")
+    end
+    -- failed=true: world tidak bisa dipakai (lock / tidak ada petak PNB) -> coba world random lain (maks 3x).
+    function rp.leaveVisit(a,why,failed)
+        if rp.warp then return end
+        local target
+        if failed then
+            rp.visitFails=(rp.visitFails or 0)+1
+            if rp.visitFails<3 then rp.phase="visit";target=rp.randomName()
+            else rp.visitFails=0;rp.phase="farm";rp.cooldownUntil=os.time()+300;target=rp.farmWorld end
+        else rp.visitFails=0;rp.phase="farm";target=rp.farmWorld end
+        log("Keluar dari world ini: "..tostring(why))
+        if not rp.beginWarp(target,why,target==rp.farmWorld,"visit") then halt("Farm World belum diisi.",true) end
+    end
+    function rp.visitWatch()
+        local a=autoLoop
+        if not a or not a.visit or rp.warp or rp.shutdown then return end
+        if a.paused then
+            if a.visitPausedRef~=a.paused then a.visitPausedRef=a.paused;a.visitPauses=(a.visitPauses or 0)+1 end
+            if os.clock()-(a.paused.at or os.clock())>45 or (a.visitPauses or 0)>=5 then
+                rp.leaveVisit(a,"tidak bisa PNB di world ini: "..tostring(a.paused.reason):sub(1,80),true)
+            end
+        end
     end
 end
 onAction(loopButton,function()
@@ -3600,7 +3821,7 @@ onAction(runButton,function()
 end)
 local function cleanup(destroying)
     if not alive then return end
-    halt("Panel ditutup; semua aksi baru dihentikan.",true);report(true);alive=false
+    rp.shutdown=true;halt("Panel ditutup; semua aksi baru dihentikan.",true);report(true);alive=false
     for _,connection in ipairs(connections) do connection:Disconnect() end
     if rayfieldUI and rayfieldUI.Destroy then pcall(rayfieldUI.Destroy) end
     rayfieldUI=nil
@@ -3627,6 +3848,8 @@ if worldClosed then connect(worldClosed.OnClientEvent,function()
 end) end
 connect(RunService.Heartbeat,function()
     if not alive then return end
+    if rp.warp then rp.warpTick() end
+    rp.visitWatch()
     if worldReturn.tick() then
         if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
         return
@@ -3674,6 +3897,32 @@ connect(RunService.Heartbeat,function()
     end
     if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
 end)
+-- Anti AFK (VirtualUser). Ikut mati saat panel ditutup; tidak menumpuk saat execute ulang.
+do
+    local okVU,VirtualUser=pcall(function() return game:GetService("VirtualUser") end)
+    if okVU and VirtualUser then
+        local token={}
+        env._GenHubAntiAFK=token
+        local function fakeActivity()
+            if not alive or env._GenHubAntiAFK~=token then return end
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(math.random(100,800),math.random(100,500)))
+                VirtualUser:CaptureController()
+                VirtualUser:SetKeyDown("s")
+                task.wait(0.2)
+                VirtualUser:SetKeyUp("s")
+            end)
+        end
+        task.spawn(function()
+            while alive and env._GenHubAntiAFK==token do
+                task.wait(math.random(480,900)) -- 8-15 menit
+                fakeActivity()
+            end
+        end)
+        connect(player.Idled,fakeActivity)
+    end
+end
 bind(true)
 -- BEGIN PNB RAYFIELD UI
 -- Bundled by tools/build_rayfield_ui.py. Configuration never starts farming.
@@ -15425,7 +15674,7 @@ return RayfieldLibrary
         ui.ready=false
         if type(library.Destroy)=="function" then library:Destroy() end
     end
-    local window=library:CreateWindow({Name="GenHub 1.9.2",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
+    local window=library:CreateWindow({Name="GenHub 1.9.3",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
         Theme="Ocean",Icon=0,ToggleUIKeybind=Enum.KeyCode.RightControl,
         DisableRayfieldPrompts=true,DisableBuildWarnings=true,
         ConfigurationSaving={Enabled=false,FileName="PNB_Farmable"},Discord={Enabled=false},KeySystem=false})
@@ -15489,10 +15738,33 @@ return RayfieldLibrary
     main:CreateButton({Name="Next Page",Callback=function() ui.page=math.min(ui.pages or 1,ui.page+1);ui.Search() end})
     local selectedTarget=main:CreateParagraph({Title="Selected Target",Content="Select a block above. Its seed is selected automatically."})
     local cycleToggle=main:CreateToggle({Name="Start Farm",CurrentValue=false,Callback=function(value)
-        local farmOn=autoLoop~=nil and not autoLoop.pnbOnly
+        local farmOn=autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)
         if ui.updating or value==farmOn then return end
-        if autoLoop and autoLoop.pnbOnly then notify("Stop PNB (PNB tab) before starting the farm cycle.");ui.Sync(true);return end
+        if autoLoop and autoLoop.pnbOnly and not autoLoop.visit then notify("Stop PNB (PNB tab) before starting the farm cycle.");ui.Sync(true);return end
         dispatch("AutoCycle")
+    end})
+    local farmWorldInput=main:CreateInput({Name="Farm World",CurrentValue="",PlaceholderText="Nama world farm (kembali ke sini)",
+        RemoveTextAfterFocusLost=false,Callback=function(value)
+            if ui.updating then return end
+            if busy() then notify("Stop the cycle before changing the Farm World.");ui.Sync(true);return end
+            local text=tostring(value):match("^%s*(.-)%s*$")
+            if text=="" then rp.farmWorld=nil;ui.Sync(true);return end
+            local n=rp.name(text)
+            if not n then notify("Nama world hanya boleh huruf, angka, _ atau -.");ui.Sync(true);return end
+            rp.farmWorld=n;log("Farm World: "..n)
+            ui.Sync(true);report(true)
+        end})
+    local randomToggle=main:CreateToggle({Name="PNB in Random World",CurrentValue=false,Callback=function(value)
+        if ui.updating or value==rp.enabled then return end
+        if value and not rp.farmWorld then
+            local _,_,w=positionSnapshot()
+            local n=w and rp.name(w)
+            if not n then notify("Isi Farm World dahulu.");ui.Sync(true);return end
+            rp.farmWorld=n;notify("Farm World diisi otomatis: "..n)
+        end
+        rp.enabled=value
+        log("PNB in Random World: "..(value and "ON" or "OFF"))
+        ui.Sync(true);report(true)
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
     main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
@@ -15519,6 +15791,9 @@ return RayfieldLibrary
         if not finite(data.range) or data.range<.5 or data.range>20 then return nil,"Collect Radius must be between 0.5 and 20 tiles." end
         local filter=normalizeFilter(data.collectFilter)
         if not filter then return nil,"Use ALL or up to 32 item IDs separated by commas." end
+        for _,key in ipairs({"farmOn","pnbOn"}) do
+            if data[key]~=nil and type(data[key])~="boolean" then return nil,"Toggle settings must be on or off." end
+        end
         for _,key in ipairs({"soundEffects","handAnimations","blockEffects"}) do
             if data[key]~=nil and type(data[key])~="boolean" then return nil,"Effect settings must be on or off." end
         end
@@ -15526,12 +15801,23 @@ return RayfieldLibrary
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
         local pnbId=integer(data.pnbId) and data.pnbId>0 and data.pnbId or nil
         return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,pnbId=pnbId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
-            soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale}
+            soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
+            farmOn=data.farmOn==true,pnbOn=data.pnbOn==true,
+            randomPnb=data.randomPnb==true,
+            farmWorld=type(data.farmWorld)=="string" and rp.name(data.farmWorld) or nil,
+            phase=data.phase=="visit" and "visit" or "farm",
+            lastWorld=type(data.lastWorld)=="string" and rp.name(data.lastWorld) or nil,
+            visitFails=integer(data.visitFails) and math.clamp(data.visitFails,0,10) or 0,
+            cooldownUntil=type(data.cooldownUntil)=="number" and data.cooldownUntil>0 and data.cooldownUntil<4e9
+                and math.floor(data.cooldownUntil) or 0}
     end
     local function currentConfig()
         return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),pnbId=ui.pnbId,hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
-            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale})
+            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,
+            farmOn=(autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)) or rp.keepOn==true,
+        pnbOn=autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit,
+        randomPnb=rp.enabled,farmWorld=rp.farmWorld,phase=rp.phase,lastWorld=rp.lastWorld,visitFails=rp.visitFails,cooldownUntil=rp.cooldownUntil})
     end
     local function settingInput(title,control,hint,tab)
         local widget=(tab or settingsTab):CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
@@ -15599,7 +15885,7 @@ return RayfieldLibrary
         idInput.Text=saved
         if not ok then halt("UI action failed: "..tostring(why)) end
     end
-    local function pnbActive() return autoLoop~=nil and autoLoop.pnbOnly==true end
+    local function pnbActive() return autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit end
     local pnbInput=pnbTab:CreateInput({Name="ID Block",CurrentValue="",PlaceholderText="Item ID of the block to place & break",
         RemoveTextAfterFocusLost=false,Callback=function(value)
             if ui.updating then return end
@@ -15633,7 +15919,7 @@ return RayfieldLibrary
     settingInput("Action Delay (seconds)",delayInput,"0.05–5",pnbTab)
     pnbTab:CreateParagraph({Title="How PNB Works",Content="Runs the same Place & Break stage as Start Farm, on its own: it places the block, breaks it, and collects every drop, over and over. It never plants or harvests, and it stops when the block runs out. At 200 seeds it stores 100 in Display Box 1422, like the farm cycle. The block needs a seed pair (ID+1). Turn Start PNB off, or press H, to stop."})
     function ui.SyncPNB()
-        local a=autoLoop and autoLoop.pnbOnly and autoLoop or nil
+        local a=autoLoop and autoLoop.pnbOnly and not autoLoop.visit and autoLoop or nil
         local shown=a and a.block or ui.pnbId
         local names={PNB="Place & Break",CEK="Checking Inventory",SETOR="Storing Seeds",JEDA="Recovering"}
         local lines={}
@@ -15678,7 +15964,14 @@ return RayfieldLibrary
         table.insert(effectMirrors,{widget=widget,key=key})
     end
     settingsTab:CreateSection("Configuration")
-    local configFile="PNB_FarmConfig.json"
+    local globalFile="PNB_FarmConfig.json"
+    local userFile="PNB_FarmConfig_"..(tostring(player.Name):gsub("[^%w_]","_"))..".json"
+    local configFile=globalFile
+    ui.scope="global"
+    if type(isfile)=="function" then -- file akun ada => akun ini memakai config sendiri (global diabaikan)
+        local okF,found=pcall(isfile,userFile)
+        if okF and found then configFile=userFile;ui.scope="user" end
+    end
     local codecOK,codec=pcall(function() return game:GetService("HttpService") end)
     local configInfo=settingsTab:CreateParagraph({Title="Configuration Status",Content=ui.configStatus})
     function ui.SaveConfig(silent)
@@ -15693,6 +15986,7 @@ return RayfieldLibrary
             local ok=pcall(function() writefile(configFile,codec:JSONEncode(data)) end)
             if ok then
                 ui.configStatus="Configuration saved. Auto Load is "..(ui.autoLoad and "enabled." or "disabled.")
+                    .." Start Farm: "..(data.farmOn and "ON" or "OFF").." | Start PNB: "..(data.pnbOn and "ON" or "OFF").."."
                 if not silent then notify("Configuration saved.") end
                 ui.Sync(true);return true
             end
@@ -15701,6 +15995,26 @@ return RayfieldLibrary
         if not silent then notify(ui.configStatus) end
         ui.Sync(true);return false
     end
+    local scopeToggle=settingsTab:CreateToggle({Name="Per-Username Config",CurrentValue=ui.scope=="user",Callback=function(value)
+        if ui.updating or value==(ui.scope=="user") then return end
+        if busy() then notify("Stop the cycle before changing the config mode.");ui.Sync(true);return end
+        if value then
+            configFile=userFile;ui.scope="user"
+            if not ui.SaveConfig(true) then
+                configFile=globalFile;ui.scope="global";ui.Sync(true);return
+            end
+            ui.configStatus="Config khusus akun "..tostring(player.Name).." dibuat. Config global tidak dipakai akun ini."
+            notify("Per-Username Config ON ("..tostring(player.Name)..").")
+        else
+            if type(delfile)~="function" then notify("Executor tidak punya delfile; hapus "..userFile.." manual lalu execute ulang.");ui.Sync(true);return end
+            if not pcall(delfile,userFile) then notify("Gagal menghapus "..userFile..".");ui.Sync(true);return end
+            configFile=globalFile;ui.scope="global"
+            ui.configStatus="Kembali ke config global. Tekan Save Config untuk menimpa global dengan setelan sekarang."
+            notify("Per-Username Config OFF.")
+        end
+        ui.Sync(true)
+    end})
+    rp.save=function() return ui.SaveConfig(true) end
     local autoLoadToggle=settingsTab:CreateToggle({Name="Auto Load",CurrentValue=true,Callback=function(value)
         if ui.updating then return end
         local previous=ui.autoLoad;ui.autoLoad=value
@@ -15782,7 +16096,7 @@ return RayfieldLibrary
         if autoLoop then
             activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
-                or autoLoop.paused and "Waiting for the server. The cycle will resume automatically."
+                or autoLoop.paused and ("Waiting for the server. The cycle will resume automatically.\n"..clean(tostring(farmNote or ""):sub(1,160)))
                 or autoLoop.hop and "Moving to a nearby tile to collect leftover blocks or seeds."
                 or farm and farm.stepRejected and "The game returned a supported step. Waiting here without switching sides."
                 or farm and farm.action and "Waiting for action confirmation."
@@ -15827,20 +16141,56 @@ return RayfieldLibrary
         table.insert(status,"PNB animations: "..(not effects.hands and "Off" or binding and type(binding.pnbAnimation)=="table" and not binding.pnbAnimation.disabled and "Ready" or "Unavailable"))
         table.insert(status,"PNB sounds: "..(not effects.sounds and "Off" or binding and type(binding.pnbSound)=="table" and not binding.pnbSound.disabled and "Ready" or "Unavailable"))
         table.insert(status,"Block break effects: "..(not effects.blocks and "Off" or binding and type(binding.pnbBlockEffects)=="table" and not binding.pnbBlockEffects.disabled and "Ready" or "Unavailable"))
+        table.insert(status,"Random PNB: "..(rp.enabled and "On" or "Off").." | Farm World: "..tostring(rp.farmWorld or "-")
+            .." | Phase: "..rp.phase..(rp.warp and (" | Warp -> "..rp.warp.target) or "")
+            ..(os.time()<(rp.cooldownUntil or 0) and (" | Cooldown "..(rp.cooldownUntil-os.time()).."s") or ""))
         table.insert(status,"Pickup distance is controlled by the server.")
         paragraph(detail,"Full Status",table.concat(status,"\n"))
-        paragraph(configInfo,"Configuration Status",ui.configStatus)
+        paragraph(configInfo,"Configuration Status",ui.configStatus.."\nMode: "..(ui.scope=="user" and ("Per-Username ("..tostring(player.Name)..")") or "Global").." | File: "..configFile)
         syncScaleInfo()
         if ui.SyncPNB then ui.SyncPNB() end
         ui.updating=true
         if scaleSlider.CurrentValue~=ui.uiScale then scaleSlider:Set(ui.uiScale) end
         if row and dropdown.CurrentOption[1]~=row.label then dropdown:Set({row.label}) end
-        local farmOn=autoLoop~=nil and not autoLoop.pnbOnly
+        local farmOn=autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)
         if cycleToggle.CurrentValue~=farmOn then cycleToggle:Set(farmOn) end
+        if farmWorldInput.CurrentValue~=(rp.farmWorld or "") then farmWorldInput:Set(rp.farmWorld or "") end
+        if randomToggle.CurrentValue~=rp.enabled then randomToggle:Set(rp.enabled) end
+        if scopeToggle.CurrentValue~=(ui.scope=="user") then scopeToggle:Set(ui.scope=="user") end
         if autoLoadToggle.CurrentValue~=ui.autoLoad then autoLoadToggle:Set(ui.autoLoad) end
         for _,item in ipairs(effectMirrors) do if item.widget.CurrentValue~=effects[item.key] then item.widget:Set(effects[item.key]) end end
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
         ui.updating=false
+    end
+    -- Dipanggil setelah script ter-execute ulang di world random (phase=visit).
+    function ui.RunVisit()
+        local b,world
+        for _=1,60 do
+            if not alive then return end
+            b=bind(false)
+            if b then
+                local _,_,w=positionSnapshot(b)
+                local fg=rawget(b.state,"fg")
+                if w and type(fg)=="table" and next(fg)~=nil then world=w;break end
+            end
+            task.wait(.5)
+        end
+        if not world then rp.leaveVisit(nil,"world random tidak terbaca",true);return end
+        task.wait(1.5)
+        if rp.name(world)==rp.name(rp.farmWorld) then
+            rp.phase="farm";runAction("AutoCycle");return -- sudah di world farm
+        end
+        local lockId,lx,ly=rp.findLock(b)
+        if lockId then
+            rp.leaveVisit(nil,string.format("ada lock (item %d) di (%d,%d)",lockId,lx,ly),true);return
+        end
+        CONFIG.pnbOnly=true;runAction("AutoCycle");CONFIG.pnbOnly=false
+        if autoLoop then
+            autoLoop.visit=true;autoLoop.visitStart=os.clock()
+            log("Random PNB: di world "..tostring(world).."; cek blok lalu PNB.")
+        else
+            rp.leaveVisit(nil,"siklus PNB tidak bisa dimulai: "..tostring(result):sub(1,100),true)
+        end
     end
     ui.Rebuild();ui.Search();ui.ready=true
     local initial=ui.byId[tonumber(idInput.Text)] or (ui.byId[4] and ui.byId[4].available and ui.byId[4])
@@ -15863,6 +16213,11 @@ return RayfieldLibrary
                     effects.sounds,effects.hands,effects.blocks=valid.soundEffects,valid.handAnimations,valid.blockEffects
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
                     ui.configStatus="Saved configuration loaded. Ready to start."
+                    rp.enabled,rp.farmWorld,rp.phase=valid.randomPnb,valid.farmWorld,valid.phase
+                    rp.visitFails,rp.cooldownUntil,rp.lastWorld=valid.visitFails,valid.cooldownUntil,valid.lastWorld
+                    if rp.phase=="visit" and not valid.farmOn then rp.phase="farm" end
+                    if valid.farmOn then ui.pendingAutoStart=(rp.phase=="visit" and rp.enabled and rp.farmWorld) and "visit" or "farm";ui.configStatus="Saved configuration loaded. Start Farm resumed."
+                    elseif valid.pnbOn and valid.pnbId then ui.pendingAutoStart="pnb";ui.configStatus="Saved configuration loaded. Start PNB resumed." end
                 else ui.configStatus="Auto Load is disabled. Default settings are in use." end
             else ui.configStatus=why.." Default settings are in use." end
         elseif type(isfile)=="function" then
@@ -15871,6 +16226,27 @@ return RayfieldLibrary
         end
     else ui.configStatus="Configuration loading is unavailable in this executor." end
     library:SetUIScale(ui.uiScale);ui.Sync(true);panel.Visible=false
+    -- FIX: nyalakan kembali toggle yang tersimpan. Siklus mulai dari JEDA dan mencoba ulang sendiri sampai game siap.
+    if ui.pendingAutoStart then
+        local mode=ui.pendingAutoStart;ui.pendingAutoStart=nil
+        task.spawn(function()
+            -- tunggu sampai tidak ada aksi lain; lalu mulai (siklus sendiri mencoba ulang sampai game siap)
+            for _=1,20 do
+                if not alive then return end
+                if not (autoLoop or running or farm or pending) then break end
+                task.wait(.5)
+            end
+            if not alive or autoLoop or running or farm or pending then return end
+            task.wait(.5)
+            if mode=="visit" then ui.RunVisit()
+            elseif mode=="farm" then runAction("AutoCycle")
+            elseif mode=="pnb" and ui.pnbId then
+                CONFIG.pnbOnly=true;runAction("AutoCycle",ui.pnbId);CONFIG.pnbOnly=false
+            end
+            if not autoLoop and not rp.warp then ui.configStatus="Config dimuat, tetapi auto start gagal: "..clean(tostring(result):sub(1,120)) end
+            report(true);ui.Sync(true)
+        end)
+    end
     log(string.format("GenHub ready; %d farmable blocks.",ui.availableCount))
     if type(writefile)=="function" then
         pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 12\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
