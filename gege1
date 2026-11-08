@@ -44,6 +44,7 @@ local blockVisual=nil
 local farm,stopFarm=nil,nil
 local autoLoop,recoverLoop=nil,nil -- Distinct from `cycle`, one place/break operation.
 local worldReturn={}
+local worldStartup={autoJoin=false,targetWorld="",farmWanted=false,status="",nextAttempt=0}
 local rayfieldUI=nil
 local uiActions={}
 local generation,currentWorld,lastBind=0,nil,-math.huge
@@ -139,7 +140,7 @@ function compatibility.exportRuntime(b)
         end
     end
 end
-function compatibility.renderer(gui)
+function compatibility.renderer(gui,allowMenu)
     local ok,list=pcall(getconnections,RunService.RenderStepped)
     if not ok or type(list)~="table" then return nil end
     local found
@@ -166,7 +167,7 @@ function compatibility.renderer(gui)
                 and hasConstants(goTo,{"Vector2","new","deadAt"}) and gv and gv[3]==state
                 and finite(gv[1]) and finite(gv[2]) and finite(uv[20]) and finite(uv[21])
                 and math.abs(gv[1]-uv[20])<.01 and math.abs(gv[2]-uv[21])<.01
-                and type(rawget(state,"fg"))=="table" and integer(rawget(state,"w")) and integer(rawget(state,"h")) then
+                and (allowMenu or type(rawget(state,"fg"))=="table" and integer(rawget(state,"w")) and integer(rawget(state,"h"))) then
                 if found then return nil end
                 found={controller=owner,template=gui:FindFirstChild("Game"),gameGui=gui,
                     state=state,renderer=fn,positionFn=goTo,camera=camera}
@@ -863,6 +864,7 @@ local function parseCollect()
     return range,filter,text
 end
 local function halt(reason,manual)
+    if manual and worldStartup.cancelFarm then worldStartup.cancelFarm() end
     clearBlockEffects()
     if autoLoop and not manual then
         reason=tostring(reason):gsub("PNB/kolek OFF","aksi dijeda")
@@ -900,7 +902,8 @@ local function report(force)
     local x,y,world=positionSnapshot()
     local loopInfo=autoLoop and string.format("SIKLUS %s | blok %d: %s | seed %d: %s | setor %d x100\n",
         autoLoop.stage,autoLoop.block,tostring(autoLoop.blocks or "?"),autoLoop.seed,tostring(autoLoop.seeds or "?"),autoLoop.deposits) or ""
-    output.Text=loopInfo..string.format("PNB Range 1.9.2 | game v%s\nWorld %s | Pos %s,%s\nPNB %s | siklus %d | TakeDrop %d\nKolek: %s | radius %.2f tile | ID %s\n%s\nAdapter: %s\n%s\n%s\n%s",
+    local startupInfo=worldStartup.status~="" and ("STARTUP: "..worldStartup.status.."\n") or ""
+    output.Text=startupInfo..loopInfo..string.format("PNB Range 1.9.2 | game v%s\nWorld %s | Pos %s,%s\nPNB %s | siklus %d | TakeDrop %d\nKolek: %s | radius %.2f tile | ID %s\n%s\nAdapter: %s\n%s\n%s\n%s",
         tostring(read(game,"PlaceVersion") or "?"),
         tostring(world or "?"),x and string.format("%.2f",x) or "?",y and string.format("%.2f",y) or "?",
         running and "ON" or "OFF",cycles,attempts,collecting and "ON" or "OFF",collectRange,filterText,farmSummary,adapterStatus,
@@ -3500,6 +3503,11 @@ do
         end
         return nil
     end
+    function worldReturn.surface(b)
+        local shown=menuVisible(b)
+        local surface=b and b.worldReturnSurface
+        return shown,surface and surface.enter
+    end
     function worldReturn.begin()
         local a=autoLoop
         if not a or a.rejoin or not name(a.pinnedWorld or a.world) then return end
@@ -3618,6 +3626,126 @@ do
         return true
     end
 end
+-- BEGIN WORLD STARTUP
+-- Startup uses the verified native menu; farming keeps its existing inventory gate.
+function worldStartup.worldName(value)
+    if type(value)~="string" then return nil end
+    value=value:match("^%s*(.-)%s*$"):upper()
+    if #value<1 or #value>64 or value:find("[^%w_%-]") then return nil end
+    return value
+end
+function worldStartup.cancelFarm()
+    worldStartup.farmWanted=false;worldStartup.manualStart=false
+    worldStartup.stableAt=nil;worldStartup.stableWorld=nil
+end
+function worldStartup.wantsFarm()
+    return worldStartup.farmWanted or autoLoop~=nil
+end
+function worldStartup.setFarm(value,automatic)
+    if not alive then return end
+    worldStartup.farmWanted=value==true
+    worldStartup.manualStart=value==true and automatic~=true
+    worldStartup.stableAt=nil;worldStartup.stableWorld=nil
+    if value~=true then
+        if autoLoop and uiActions.AutoCycle then uiActions.AutoCycle() end
+        worldStartup.status=""
+    elseif worldStartup.tick then worldStartup.tick() end
+end
+function worldStartup.setJoin(enabled,world)
+    worldStartup.autoJoin=enabled==true
+    worldStartup.targetWorld=worldStartup.worldName(world) or ""
+    worldStartup.nextAttempt=0
+    worldStartup.stableAt=nil
+end
+function worldStartup.menuBinding(b)
+    if b then worldStartup.menuContext=b;return b end
+    local gui=playerGui:FindFirstChild("GameGui")
+    local previous=worldStartup.menuContext
+    if previous and previous.gameGui==gui and previous.camera:IsDescendantOf(playerGui) then return previous end
+    if not gui then return nil end
+    -- Initial world selection has no dimensions, inventory, or active position yet.
+    local context=compatibility.renderer(gui,true)
+    worldStartup.menuContext=context
+    return context
+end
+function worldStartup.tick()
+    local s=worldStartup
+    if not alive or not rayfieldUI or not rayfieldUI.ready then return false end
+    if autoLoop then s.status="";return false end
+    if not s.job and not s.autoJoin and not s.farmWanted then s.status="";return false end
+    local now=os.clock()
+    if s.job then
+        if not s.job.done then s.status="Joining "..s.job.world..". Waiting for the server.";return true end
+        local job=s.job;s.job=nil;s.stableAt=nil;s.manualStart=false
+        if not job.reply[1] or job.reply[2]==false then
+            s.status="Could not join "..job.world..". Retrying when the world menu is ready."
+        end
+    end
+    if running or farm or pending then return false end
+    local b=bind(false)
+    local context=s.menuBinding(b)
+    local shown,enter=worldReturn.surface(context)
+    if shown==true then
+        s.stableAt=nil;s.stableWorld=nil;s.manualStart=false
+        if not s.autoJoin then
+            s.status=s.farmWanted and "Waiting for a world to open before starting the farm." or ""
+            return s.farmWanted
+        end
+        local target=s.worldName(s.targetWorld)
+        if not target then s.status="Enter a Target World in Settings.";return true end
+        if not enter then s.status="Waiting for the world menu to become ready.";return true end
+        if (lease.outstanding or 0)>0 or Input:GetFocusedTextBox() then
+            s.status="Waiting for the current request or text entry to finish.";return true
+        end
+        if now<s.nextAttempt then s.status="Waiting to join "..target..".";return true end
+        s.attempts=(s.attempts or 0)+1
+        s.nextAttempt=now+math.min(15,3+s.attempts*2)
+        local job={world=target,started=now,done=false};s.job=job
+        lease.outstanding=(lease.outstanding or 0)+1
+        s.status="Joining "..target.."."
+        task.spawn(function()
+            job.reply=table.pack(pcall(enter,target))
+            job.done=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
+        end)
+        return true
+    end
+    if shown==nil and s.farmWanted and not s.manualStart then
+        s.status="Waiting for the world interface to become ready.";return true
+    end
+    local x,y,world=livePosition(b)
+    if not x then
+        s.stableAt=nil
+        s.status="Waiting for the character and world to become ready."
+        return s.farmWanted or s.autoJoin and shown~=false
+    end
+    local target=s.worldName(s.targetWorld)
+    if target and world~=target then
+        s.stableAt=nil;s.stableWorld=nil
+        s.status="Waiting for "..target..". Open the world menu to join it."
+        return s.farmWanted
+    end
+    if s.autoJoin and not target then s.status="Enter a Target World in Settings.";return s.farmWanted end
+    if not s.farmWanted then s.status="World ready.";s.attempts=0;return false end
+    if s.stableWorld~=world then s.stableWorld=world;s.stableAt=now end
+    if not s.manualStart and now-(s.stableAt or now)<.5 then
+        s.status="World ready. Waiting for the character to settle.";return true
+    end
+    if (lease.outstanding or 0)>0 then s.status="Waiting for the current server request.";return true end
+    if Input:GetFocusedTextBox() then s.status="Finish typing before the farm starts.";return true end
+    if not rayfieldUI.ValidateStartupTarget or not rayfieldUI.ValidateStartupTarget(b) then
+        s.status="Waiting for a valid Farmable Target in this world.";return true
+    end
+    if now<(s.nextStart or 0) then return true end
+    s.nextStart=now+2;s.manualStart=false
+    local action=uiActions.AutoCycle
+    if not action then s.status="Waiting for farm controls.";return true end
+    local ok,why=pcall(action)
+    if not ok then s.status="Could not start the farm. Waiting to retry.";return true end
+    s.status=autoLoop and "Farm started. Checking server inventory." or "Waiting to start the farm."
+    return autoLoop==nil
+end
+
+-- END WORLD STARTUP
 onAction(loopButton,function()
     if autoLoop then halt("Siklus otomatis OFF.",true);report(true);return end
     if farm or running or pending then log("Stop mode aktif dahulu sebelum memulai siklus otomatis.");report(true);return end
@@ -3729,6 +3857,10 @@ if not binding then
 end
 connect(RunService.Heartbeat,function()
     if not alive then return end
+    if worldStartup.tick and worldStartup.tick() then
+        if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
+        return
+    end
     if worldReturn.tick() then
         if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
         return
@@ -3778,7 +3910,7 @@ connect(RunService.Heartbeat,function()
 end)
 bind(true)
 -- BEGIN PNB RAYFIELD UI
--- Bundled by tools/build_rayfield_ui.py. Configuration never starts farming.
+-- Bundled by tools/build_rayfield_ui.py. Startup restores explicitly saved intent.
 local function installRayfield()
     -- The original logo is a separate immutable PNG, cached in the executor workspace.
 local function genhubLogoAsset()
@@ -15715,7 +15847,7 @@ return RayfieldLibrary
     assert(type(library)=="table" and type(library.CreateWindow)=="function","Rayfield could not be loaded.")
     local defaultScale=Input.TouchEnabled and 75 or 100
     local ui={library=library,updating=false,ready=false,query="",page=1,pageSize=80,rows={},byId={},options={},
-        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,configStatus="No saved configuration."}
+        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,autoJoinWorld=false,targetWorld="",configStatus="No saved configuration."}
     rayfieldUI=ui
         -- Local nameplate visibility only; the game's player identity stays intact.
     do
@@ -15881,8 +16013,8 @@ return RayfieldLibrary
     main:CreateButton({Name="Next Page",Callback=function() ui.page=math.min(ui.pages or 1,ui.page+1);ui.Search() end})
     local selectedTarget=main:CreateParagraph({Title="Selected Target",Content="Select a block above. Its seed is selected automatically."})
     local cycleToggle=main:CreateToggle({Name="Start Farm",CurrentValue=false,Callback=function(value)
-        if ui.updating or value==(autoLoop~=nil) then return end
-        dispatch("AutoCycle")
+        if ui.updating or value==worldStartup.wantsFarm() then return end
+        worldStartup.setFarm(value);ui.Sync(true);report(true)
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
     main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
@@ -15903,7 +16035,16 @@ return RayfieldLibrary
     end
     local function validate(data)
         if type(data)~="table" or data.version~=1 or type(data.autoLoad)~="boolean" then return nil,"Invalid configuration format." end
-        if not integer(data.targetId) or not ui.byId[data.targetId] or not pair(ui.db,data.targetId) then return nil,"The saved target is not available in this game." end
+        if not integer(data.targetId) or data.targetId<=0 then return nil,"Invalid Farmable Target." end
+        if ui.db and (not ui.byId[data.targetId] or not pair(ui.db,data.targetId)) then return nil,"The saved target is not available in this game." end
+        for _,key in ipairs({"autoJoinWorld","startFarm"}) do
+            if data[key]~=nil and type(data[key])~="boolean" then return nil,"Startup settings must be on or off." end
+        end
+        if data.targetWorld~=nil and type(data.targetWorld)~="string" then return nil,"Invalid Target World." end
+        local targetWorld=data.targetWorld or ""
+        if targetWorld:match("^%s*$") then targetWorld=""
+        else targetWorld=worldStartup.worldName(targetWorld);if not targetWorld then return nil,"Use up to 64 letters, numbers, underscores, or hyphens for Target World." end end
+        if data.autoJoinWorld==true and targetWorld=="" then return nil,"Enter a Target World before saving Auto Join World." end
         if not integer(data.hits) or data.hits<1 or data.hits>50 then return nil,"Hits per Block must be a whole number from 1 to 50." end
         if not finite(data.delay) or data.delay<.05 or data.delay>5 then return nil,"Action Delay must be between 0.05 and 5 seconds." end
         if not finite(data.range) or data.range<.5 or data.range>20 then return nil,"Collect Radius must be between 0.5 and 20 tiles." end
@@ -15917,12 +16058,13 @@ return RayfieldLibrary
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
         return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
-            hideUsername=data.hideUsername==true}
+            hideUsername=data.hideUsername==true,autoJoinWorld=data.autoJoinWorld==true,targetWorld=targetWorld,startFarm=data.startFarm==true}
     end
     local function currentConfig()
         return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
-            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername})
+            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername,
+            autoJoinWorld=ui.autoJoinWorld,targetWorld=ui.targetWorld,startFarm=worldStartup.wantsFarm()})
     end
     local function settingInput(title,control,hint)
         local widget=settingsTab:CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
@@ -15936,6 +16078,27 @@ return RayfieldLibrary
             end})
         table.insert(inputMirrors,{widget=widget,control=control})
     end
+    settingsTab:CreateSection("Startup")
+    local worldInput
+    worldInput=settingsTab:CreateInput({Name="Target World",CurrentValue="",PlaceholderText="World name",RemoveTextAfterFocusLost=false,
+        Callback=function(value)
+            if ui.updating then return end
+            if busy() then notify("Stop the cycle before changing the target world.");ui.Sync(true);return end
+            local name=tostring(value):match("^%s*(.-)%s*$")
+            local normalized=name=="" and "" or worldStartup.worldName(name)
+            if normalized==nil then notify("Enter a valid world name using letters, numbers, underscores, or hyphens.")
+            else ui.targetWorld=normalized;worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld) end
+            ui.Sync(true)
+        end})
+    local joinToggle=settingsTab:CreateToggle({Name="Auto Join World",CurrentValue=false,Callback=function(value)
+        if ui.updating then return end
+        ui.autoJoinWorld=value==true;worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld);ui.Sync(true)
+    end})
+    local autoStartToggle=settingsTab:CreateToggle({Name="Auto Start Farm",CurrentValue=false,Callback=function(value)
+        if ui.updating then return end
+        worldStartup.setFarm(value);ui.Sync(true);report(true)
+    end})
+    settingsTab:CreateParagraph({Title="Automatic Startup",Content="Set a target world and enable Auto Join World. Start Farm and Auto Start Farm control the same saved on/off state. Save Config, then keep Auto Load enabled to restore it next run. Farming waits for the target world, character, and server inventory."})
     settingsTab:CreateSection("Interface")
     local privacyToggle=settingsTab:CreateToggle({Name="Hide Username",CurrentValue=false,Callback=function(value)
         if ui.updating then return end
@@ -16017,7 +16180,7 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
-    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, effects, UI size, and Hide Username preference. Auto Load restores them next time. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
+    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, target world, Auto Join World, Start Farm on/off state, PNB and collection settings, effects, UI size, and Hide Username. Auto Load restores them next run. Turn Start Farm off to cancel farming, including a queued automatic start."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
         local b=bind(false)
@@ -16076,6 +16239,16 @@ return RayfieldLibrary
         log("Farmable Target: "..row.name.."; seed: "..row.seedName..".")
         ui.Sync(true);report(true);return true
     end
+    function ui.ValidateStartupTarget(b)
+        if not b or not b.itemDB then return false end
+        if ui.db~=b.itemDB then ui.Rebuild();ui.Search() end
+        local id=tonumber(idInput.Text)
+        if not integer(id) or not pair(ui.db,id) then
+            ui.configStatus="The saved Farmable Target is not available in this world. Select another block."
+            return false
+        end
+        ui.pendingTarget=nil;return true
+    end
     local stages={PNB="Place & Break",TANAM="Planting",PANEN="Harvesting",TUNGGU="Waiting for Growth",SETOR="Storing Seeds",CEK="Checking Inventory",JEDA="Recovering"}
     function ui.Sync(force)
         if not ui.ready or not alive or not force and os.clock()-ui.lastSync<.5 then return end
@@ -16088,7 +16261,8 @@ return RayfieldLibrary
         local x,y,world=positionSnapshot()
         local stage=autoLoop and (stages[autoLoop.stage] or "Checking") or "Idle"
         local stock=autoLoop and ("\nBlocks: "..tostring(autoLoop.blocks or "—").." • Seeds: "..tostring(autoLoop.seeds or "—")) or ""
-        local activity="Ready to start."
+        local activity=worldStartup.status~="" and worldStartup.status or "Ready to start."
+        if not autoLoop and worldStartup.wantsFarm() then stage="Starting" end
         if autoLoop then
             activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
@@ -16106,7 +16280,7 @@ return RayfieldLibrary
         paragraph(summary,"Farm Status",stage..stock.."\n"..activity)
         local status={"GenHub 1.9.2 | Game version "..tostring(read(game,"PlaceVersion") or "—"),
             "World: "..clean(world or "Unavailable")..(x and string.format(" | Position: %.2f, %.2f",x,y) or ""),
-            "Start Farm: "..(autoLoop and "On" or "Off").." | Stage: "..stage,
+            "Start Farm: "..(worldStartup.wantsFarm() and "On" or "Off").." | Stage: "..stage,
             "Target: "..(row and clean(row.name).." ["..row.id.."] | Seed: "..(row.id+1) or "Not selected"),
             "PNB: "..(running and "On" or "Off").." | Completed cycles: "..cycles,
             "Auto Collect: "..(collecting and "On" or "Off")..string.format(" | Radius: %.2f tiles | Filter: %s",collectRange,clean(filterText)),
@@ -16143,7 +16317,11 @@ return RayfieldLibrary
         if scaleSlider.CurrentValue~=ui.uiScale then scaleSlider:Set(ui.uiScale) end
         if privacyToggle.CurrentValue~=ui.hideUsername then privacyToggle:Set(ui.hideUsername) end
         if row and dropdown.CurrentOption[1]~=row.label then dropdown:Set({row.label}) end
-        if cycleToggle.CurrentValue~=(autoLoop~=nil) then cycleToggle:Set(autoLoop~=nil) end
+        local wanted=worldStartup.wantsFarm()
+        if cycleToggle.CurrentValue~=wanted then cycleToggle:Set(wanted) end
+        if autoStartToggle.CurrentValue~=wanted then autoStartToggle:Set(wanted) end
+        if joinToggle.CurrentValue~=ui.autoJoinWorld then joinToggle:Set(ui.autoJoinWorld) end
+        if worldInput.CurrentValue~=ui.targetWorld then worldInput:Set(ui.targetWorld) end
         if autoLoadToggle.CurrentValue~=ui.autoLoad then autoLoadToggle:Set(ui.autoLoad) end
         for _,item in ipairs(effectMirrors) do if item.widget.CurrentValue~=effects[item.key] then item.widget:Set(effects[item.key]) end end
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
@@ -16163,13 +16341,20 @@ return RayfieldLibrary
             local valid,why=validate(data)
             if valid then
                 ui.autoLoad=valid.autoLoad
-                if valid.autoLoad and ui.Select(valid.targetId) then
+                if valid.autoLoad then
+                    if ui.db then ui.Select(valid.targetId)
+                    else
+                        idInput.Text=tostring(valid.targetId);seedInput.Text=tostring(valid.targetId+1);ui.pendingTarget=valid.targetId
+                    end
                     hitsInput.Text=tostring(valid.hits);delayInput.Text=tostring(valid.delay==.15 and CONFIG.interval or valid.delay)
                     rangeInput.Text=tostring(valid.range);filterInput.Text=valid.collectFilter
                     effects.sounds,effects.hands,effects.blocks=valid.soundEffects,valid.handAnimations,valid.blockEffects
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
                     ui.hideUsername=valid.hideUsername;ui.usernamePrivacy.Set(ui.hideUsername)
-                    ui.configStatus="Saved configuration loaded. Ready to start."
+                    ui.autoJoinWorld,ui.targetWorld=valid.autoJoinWorld,valid.targetWorld
+                    worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld)
+                    ui.configStatus="Saved configuration loaded."
+                    worldStartup.setFarm(valid.startFarm,true)
                 else ui.configStatus="Auto Load is disabled. Default settings are in use." end
             else ui.configStatus=why.." Default settings are in use." end
         elseif type(isfile)=="function" then
@@ -16180,7 +16365,7 @@ return RayfieldLibrary
     library:SetUIScale(ui.uiScale);ui.Sync(true);panel.Visible=false
     log(string.format("GenHub ready; %d farmable blocks.",ui.availableCount))
     if type(writefile)=="function" then
-        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 13\nLogo: "..(ui.logoAsset and "Original GenHub PNG" or "GenHub text fallback").."\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
+        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 14\nLogo: "..(ui.logoAsset and "Original GenHub PNG" or "GenHub text fallback").."\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
             ui.referenceCount,ui.availableCount,ui.selected and (ui.selected.name.." ["..ui.selected.id.."]") or "Not selected",tostring(ui.autoLoad),tostring(ui.uiScale),ui.configStatus))
     end
 end
