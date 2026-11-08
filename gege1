@@ -44,9 +44,6 @@ local blockVisual=nil
 local farm,stopFarm=nil,nil
 local autoLoop,recoverLoop=nil,nil -- Distinct from `cycle`, one place/break operation.
 local worldReturn={}
--- Random-world PNB (GenHub 1.9.3). State is shared by the cycle code and the Rayfield UI.
-local rp={enabled=false,farmWorld=nil,phase="farm",visitFails=0,cooldownUntil=0,keepOn=false,
-    warp=nil,save=nil,shutdown=false}
 local rayfieldUI=nil
 local uiActions={}
 local generation,currentWorld,lastBind=0,nil,-math.huge
@@ -71,9 +68,10 @@ local function captures(values,target)
     for _,value in pairs(values or {}) do if value==target then return true end end
     return false
 end
+local compatibility={aliases={},registries={},events={}}
 local function ownerMatches(fn,owner)
     local ok,scope=pcall(getfenv,fn)
-    return ok and type(scope)=="table" and scope.script==owner
+    return ok and type(scope)=="table" and (scope.script==owner or compatibility.aliases[owner]~=nil and compatibility.aliases[owner]==scope.script)
 end
 local function ownedArity(fn,owner,arity)
     if type(fn)~="function" or not ownerMatches(fn,owner) then return false end
@@ -93,6 +91,150 @@ local function functionOwner(fn)
     local ok,scope=pcall(getfenv,fn)
     return ok and type(scope)=="table" and scope.script or nil
 end
+-- Native references are validated against their live state, not randomized names.
+function compatibility.alias(fn,template,markers,arity)
+    if not template or type(fn)~="function" or not hasConstants(fn,markers) then return false end
+    local actual=functionOwner(fn)
+    if typeof(actual)~="Instance" or not (actual:IsA("LocalScript") or actual:IsA("ModuleScript") or actual:IsA("Script")) then return false end
+    local ok,n,vararg=pcall(debug.info,fn,"a")
+    if arity~=nil and (not ok or n~=arity or vararg) then return false end
+    if actual~=template and actual.Parent~=nil then return false end
+    compatibility.aliases[template]=actual
+    return true
+end
+function compatibility.others(b)
+    if b.others then return b.others end
+    local template=b.gameGui and b.gameGui:FindFirstChild("Others")
+    for _,value in pairs(upvalues(rawget(b.state,"enter")) or {}) do
+        if type(value)=="table" then
+            local update,sendHit=rawget(value,"update"),rawget(value,"sendHit")
+            if compatibility.alias(update,template,{"seen","group","nameBox"},4)
+                and ownedArity(sendHit,template,2) and hasConstants(sendHit,{"act","send","kind"}) then
+                local uv=upvalues(update);local sender=uv and uv[1]
+                if ownedArity(sender,template,1) and hasConstants(sender,{"state","move","send","flags"}) then
+                    local sv=upvalues(sender);local config=sv and sv[1]
+                    local getter=type(config)=="table" and rawget(config,"state")
+                    local gv=ownedArity(getter,b.controller,0) and upvalues(getter)
+                    if gv and gv[1]==b.state and hasConstants(getter,{"active","x","y","vx","vy","dead"}) then
+                        b.others,b.stateGetter,b.network=value,getter,sv[5]
+                        return value
+                    end
+                end
+            end
+        end
+    end
+end
+function compatibility.exportRuntime(b)
+    if type(getscriptbytecode)~="function" or type(writefile)~="function" then return end
+    compatibility.exported=compatibility.exported or {}
+    if compatibility.exported[b.controller] then return end
+    compatibility.exported[b.controller]=true
+    for _,entry in ipairs({{"Game",b.controller},{"Others",b.others and functionOwner(rawget(b.others,"update"))},
+        {"Net",type(b.network)=="table" and functionOwner(rawget(b.network,"call"))}}) do
+        if typeof(entry[2])=="Instance" then
+            local ok,bytes=pcall(getscriptbytecode,entry[2])
+            if ok and type(bytes)=="string" and #bytes>0 and #bytes<2000000 then
+                pcall(writefile,"PNBRange_Runtime_"..tostring(game.PlaceVersion).."_"..entry[1]..".luauc",bytes)
+            end
+        end
+    end
+end
+function compatibility.renderer(gui)
+    local ok,list=pcall(getconnections,RunService.RenderStepped)
+    if not ok or type(list)~="table" then return nil end
+    local found
+    for index,connection in ipairs(list) do
+        if index>64 then break end
+        local fn=read(connection,"Function");local owner=functionOwner(fn)
+        if type(fn)=="function" and hasConstants(fn,{"punchFresh","punchPressed","GetServerTimeNow"}) then
+            local rv=upvalues(fn);local st=rv and rv[1];local gf=type(st)=="table" and rawget(st,"goTo")
+            local gv=upvalues(gf)
+            compatibility.lastProbe="owner="..(typeof(owner)=="Instance" and owner.ClassName or typeof(owner))
+                .." renderer="..tostring(ownedArity(fn,owner,1)).." goTo="..tostring(ownedArity(gf,owner,2))
+                .." markers="..tostring(type(gf)=="function" and hasConstants(gf,{"Vector2","new","deadAt"}))
+                .." state="..tostring(gv and gv[3]==st).." camera="..tostring(rv and typeof(rv[4]))
+                .." world="..tostring(rv and typeof(rv[6]))
+        end
+        if read(connection,"Enabled")~=false and typeof(owner)=="Instance"
+            and (owner:IsA("LocalScript") or owner:IsA("ModuleScript") or owner:IsA("Script"))
+            and ownedArity(fn,owner,1) and hasConstants(fn,{"punchFresh","punchPressed","GetServerTimeNow"}) then
+            local uv=upvalues(fn);local state=uv and uv[1];local camera,world=uv and uv[4],uv and uv[6]
+            local goTo=type(state)=="table" and rawget(state,"goTo")
+            local gv=ownedArity(goTo,owner,2) and upvalues(goTo)
+            if typeof(camera)=="Instance" and camera:IsA("Frame") and typeof(world)=="Instance"
+                and world.Parent==gui and camera.Parent==world and camera:IsDescendantOf(playerGui)
+                and hasConstants(goTo,{"Vector2","new","deadAt"}) and gv and gv[3]==state
+                and finite(gv[1]) and finite(gv[2]) and finite(uv[20]) and finite(uv[21])
+                and math.abs(gv[1]-uv[20])<.01 and math.abs(gv[2]-uv[21])<.01
+                and type(rawget(state,"fg"))=="table" and integer(rawget(state,"w")) and integer(rawget(state,"h")) then
+                if found then return nil end
+                found={controller=owner,template=gui:FindFirstChild("Game"),gameGui=gui,
+                    state=state,renderer=fn,positionFn=goTo,camera=camera}
+            end
+        end
+    end
+    if found then compatibility.others(found);compatibility.exportRuntime(found) end
+    return found
+end
+function compatibility.callbacks(b,name)
+    local out={}
+    local state=b.state
+    local direct=name=="DropTaken" and rawget(state,"dropTaken")
+        or name=="TreeChanged" and (upvalues(rawget(state,"tileChanged")) or {})[5]
+    if type(direct)=="function" and ownerMatches(direct,b.controller) then
+        out[1]={fn=direct,up=upvalues(direct)}
+        return out
+    end
+    local net=b.network;local events=type(net)=="table" and rawget(net,"EVENTS")
+    local definition=type(events)=="table" and rawget(events,name)
+    local packet=type(definition)=="table" and rawget(net,rawget(definition,"packet"))
+    if type(packet)~="table" then return out end
+    local queue={{rawget(packet,"listen"),0}};local seen,head,count={},1,0
+    while head<=#queue and count<160 do
+        local entry=queue[head];head+=1;local value,depth=entry[1],entry[2]
+        if (type(value)=="table" or type(value)=="function") and not seen[value] then
+            seen[value]=true;count+=1
+            local children=type(value)=="function" and upvalues(value) or value
+            if type(value)=="function" and children and children[1]==definition and children[2]==net
+                and hasConstants(value,{"worldTag","unpack"}) and ownerMatches(children[4],b.controller) then
+                table.insert(out,{fn=children[4],up=upvalues(children[4])})
+            elseif children and depth<5 then
+                local visited=0
+                for _,child in pairs(children) do
+                    visited+=1;if visited>64 then break end
+                    if child~=net and child~=events and (type(child)=="table" or type(child)=="function") then
+                        queue[#queue+1]={child,depth+1}
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+function compatibility.connect(b,name,fn)
+    local remote=remotes:FindFirstChild(name)
+    if remote and remote:IsA("RemoteEvent") then return remote.OnClientEvent:Connect(fn) end
+    local net=b and b.network;local definitions=type(net)=="table" and rawget(net,"EVENTS")
+    if type(definitions)~="table" or type(rawget(definitions,name))~="table"
+        or type(rawget(net,"on"))~="function" then return nil end
+    local registry=compatibility.events[net]
+    if not registry then registry={};compatibility.events[net]=registry end
+    local listeners=registry[name]
+    if not listeners then
+        listeners={};registry[name]=listeners
+        local ok=pcall(net.on,name,function(...)
+            for listener,callback in pairs(listeners) do
+                if listener.Connected then callback(...) end
+            end
+        end,function() return rawget(b.state,"name") end)
+        if not ok then registry[name]=nil;return nil end
+    end
+    local listener={Connected=true}
+    function listener:Disconnect() self.Connected=false;listeners[self]=nil end
+    listeners[listener]=fn
+    return listener
+end
+
 local function functionDescription(fn)
     if type(fn)~="function" then return "type="..typeof(fn) end
     local owner=functionOwner(fn)
@@ -133,20 +275,13 @@ local function debugPosition()
     if not world or not finite(x) or not finite(y) then return nil end
     return x,y,world,tonumber(text:match("hp%s+([%d%.]+)"))
 end
-local function othersFrom(ev) -- PATCH 1179: indeks upvalue enter bergeser (5 -> 6)
-    for _,v in pairs(ev or {}) do
-        if type(v)=="table" and type(rawget(v,"update"))=="function" and type(rawget(v,"sendHit"))=="function" then return v end
-    end
-    return nil
-end
 local function gameRenderer(fn,controller)
     return ownedArity(fn,controller,1) and hasConstants(fn,{"punchFresh","punchPressed","GetServerTimeNow"})
 end
 local function nativeStateSnapshot(b)
     if not b then return nil end
     if not b.stateGetter then
-        local ev=upvalues(rawget(b.state,"enter"))
-        local others=othersFrom(ev)
+        local others=compatibility.others(b)
         local update=type(others)=="table" and rawget(others,"update")
         local module=b.gameGui and b.gameGui:FindFirstChild("Others")
         local uv=module and ownedArity(update,module,4) and upvalues(update)
@@ -164,7 +299,7 @@ local function nativeStateSnapshot(b)
     return s
 end
 local function nativePosition(b)
-    if not b or not b.renderer or not b.camera:IsDescendantOf(playerGui) or b.controller.Parent~=b.gameGui then return nil end
+    if not b or not b.renderer or not b.camera:IsDescendantOf(playerGui) or not (b.controller.Parent==b.gameGui or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")) then return nil end
     local values=upvalues(b.renderer)
     if not values or values[1]~=b.state then return nil end
     local x,y,hp=values[20],values[21],values[37]
@@ -173,15 +308,21 @@ local function nativePosition(b)
     if type(world)~="string" or world=="" or not integer(w) or not integer(h) or w<=0 or h<=0
         or type(rawget(b.state,"fg"))~="table" or not finite(x) or not finite(y)
         or (b.stateGetter and (not s or math.abs(s.x-x)>.01 or math.abs(s.y-y)>.01))
+        or (not b.stateGetter and not finite(hp))
         or x<0 or x>w or y< -4 or y>h then return nil end
-    return x,y,world,nil -- PATCH 1179: upvalue 37 bukan hp lagi
+    return x,y,world,not b.stateGetter and hp or nil
 end
 local function positionSnapshot(b)
     local x,y,world,hp=debugPosition()
     if x then return x,y,world,hp end
     return nativePosition(b or binding)
 end
-local function callbacks(name,controller)
+local function callbacks(name,controller,b)
+    b=b or (compatibility.active and compatibility.active.controller==controller and compatibility.active)
+    if b and b.network then
+        local found=compatibility.callbacks(b,name)
+        if #found>0 then return found end
+    end
     local remote=remotes:FindFirstChild(name)
     if not remote or not remote:IsA("RemoteEvent") then return {} end
     local ok,list=pcall(getconnections,remote.OnClientEvent)
@@ -201,7 +342,7 @@ end
 local function bind(force)
     local gameGui=playerGui:FindFirstChild("GameGui")
     local controller=gameGui and gameGui:FindFirstChild("Game")
-    if binding and binding.controller==controller and binding.camera:IsDescendantOf(playerGui)
+    if binding and controller and binding.gameGui==gameGui and (binding.controller==controller or binding.template==controller) and binding.camera:IsDescendantOf(playerGui)
         and not force then return binding end
     if not force and os.clock()-lastBind<2 then return nil end
     lastBind=os.clock();binding=nil
@@ -212,9 +353,11 @@ local function bind(force)
     end
     local worldGui=gameGui and gameGui:FindFirstChild("World")
     local camera=worldGui and worldGui:FindFirstChild("Camera")
+    local native=gameGui and compatibility.renderer(gameGui)
+    if native then controller,camera=native.controller,native.camera;compatibility.active=native end
     local x,y=debugPosition()
     if not controller or not camera or (not x and gameGui:FindFirstChild("Debug")) then
-        adapterStatus="Posisi GameGui belum terbaca.";return nil
+        adapterStatus="Posisi GameGui belum terbaca."..(compatibility.lastProbe and " "..compatibility.lastProbe or "");return nil
     end
     local candidates,seen={},{}
     for _,callback in ipairs(callbacks("MoveTo",controller)) do
@@ -231,30 +374,10 @@ local function bind(force)
             end
         end
     end
-    if #candidates==0 then -- PATCH 1179: nama remote MoveTo diacak; ambil state dari renderer
-        local okR,rlist=pcall(getconnections,RunService.RenderStepped)
-        if okR and type(rlist)=="table" then
-            for index,connection in ipairs(rlist) do
-                if index>64 then break end
-                local rfn=read(connection,"Function")
-                if read(connection,"Enabled")~=false and gameRenderer(rfn,controller) then
-                    local rv=upvalues(rfn)
-                    local st=rv and rv[1]
-                    local goTo=type(st)=="table" and rawget(st,"goTo")
-                    local gvv=type(goTo)=="function" and upvalues(goTo)
-                    if gvv and not seen[goTo] and ownedArity(goTo,controller,2)
-                        and hasConstants(goTo,{"Vector2","new","deadAt","0.5","1"})
-                        and finite(gvv[1]) and finite(gvv[2])
-                        and (not x or math.abs(gvv[1]-x)<=.25 and math.abs(gvv[2]-y)<=.25) then
-                        seen[goTo]=true
-                        table.insert(candidates,{positionFn=goTo,state=st,controller=controller,camera=camera,gameGui=gameGui})
-                    end
-                end
-            end
-        end
-    end
+    if native then candidates={native} end
     if #candidates~=1 then adapterStatus="Binding posisi tidak cocok: "..#candidates.." kandidat.";return nil end
     local b=candidates[1]
+    compatibility.active=b
     if not x then
         -- v1012 removed Debug. Match the renderer's live position and state to MoveTo.
         local position=upvalues(b.positionFn)
@@ -293,14 +416,12 @@ local function bind(force)
             end
         end
     end
-    if #lists~=1 then -- PATCH 1179: ambil tabel drop langsung dari state.dropList / state.dropTaken
-        local dl=rawget(b.state,"dropList")
-        local dv=type(dl)=="function" and ownedArity(dl,controller,0) and upvalues(dl)
-        if dv and type(dv[1])=="table" then
-            lists={{fn=dl,index=1}}
-            local dt=rawget(b.state,"dropTaken")
-            local dtu=type(dt)=="function" and upvalues(dt)
-            if dtu and dtu[1]==dv[1] then takenCallbacks={{fn=dt,up=dtu}} end
+    if #lists==0 and b.network then
+        local taken=rawget(b.state,"dropTaken")
+        local tv=ownedArity(taken,controller,2) and upvalues(taken)
+        if tv and tv[2]==b.state and type(tv[1])=="table"
+            and hasConstants(taken,{"uid","n","dropArrived","id"}) then
+            lists[1]={fn=taken,index=1}
         end
     end
     if #lists~=1 then adapterStatus="Tabel drop aktif belum cocok: "..#lists.." kandidat.";return nil end
@@ -332,7 +453,7 @@ local function bind(force)
         local owner=functionOwner(fn)
         -- HUD methods may be supplied by a nested HUD module instead of ChatUI.
         if typeof(owner)~="Instance" or not (owner==controller or owner:IsA("ModuleScript")
-            and owner:IsDescendantOf(gameGui)) then return false end
+            and owner:IsDescendantOf(gameGui) or b.network and owner.Parent==nil and (owner:IsA("Script") or owner:IsA("LocalScript") or owner:IsA("ModuleScript"))) then return false end
         local ok,n,vararg=pcall(debug.info,fn,"a")
         -- Native Game calls setGems with one argument. ChatUI may declare an
         -- optional second animation argument, which is omitted by Game as well.
@@ -345,6 +466,13 @@ local function bind(force)
             table.insert(bindingNotes,"  addGems "..functionDescription(rawget(hud,"addGems")))
             table.insert(bindingNotes,"  setGems "..functionDescription(rawget(hud,"setGems")))
             table.insert(bindingNotes,"  same S.addGems="..tostring(rawget(hud,"addGems")==rawget(b.state,"addGems")))
+            local keys={};local count=0
+            for key,value in pairs(hud) do
+                count+=1;if count>60 then break end
+                if type(key)=="string" then table.insert(keys,key..":"..typeof(value)) end
+            end
+            table.insert(bindingNotes,"  HUD fields "..table.concat(keys,","))
+            table.insert(bindingNotes,"  HUD indexed setGems "..functionDescription(read(hud,"setGems")))
         end
         -- Live 1.4 trace: this movement-state table has no S.addGems/console.
         -- The original Game.LevelUp callback still captures the real ChatUI.
@@ -366,7 +494,11 @@ local function bind(force)
             table.insert(bindingNotes,"LevelUp "..functionDescription(callback.fn))
             local hud=callback.up[1]
             if ownedArity(callback.fn,controller,5) and hasConstants(callback.fn,{"setGems","levelup2","UserId"})
-                then considerHUD(hud,"LevelUp up1") end
+                then
+                    for index,value in pairs(callback.up) do
+                        if type(value)=="table" then considerHUD(value,"LevelUp up"..tostring(index)) end
+                    end
+                end
         end
     end
     local hud,hudCount=nil,0
@@ -376,16 +508,13 @@ local function bind(force)
     if ownedArity(enter,controller,2) and hasConstants(enter,{"InvokeServer","goTo"}) then
         local values=upvalues(enter)
         local solid=values and values[4]
+        for _,candidate in pairs(values or {}) do
+            if ownedArity(candidate,controller,2) and hasConstants(candidate,{"w","h","fg","solid"}) then solid=candidate end
+        end
         if ownedArity(solid,controller,2) and hasConstants(solid,{"w","h","fg","solid"}) then
             local source=upvalues(solid)
             if source and source[1]==b.state and type(source[2])=="table" then b.itemDB=source[2] end
         end
-    end
-    if not b.itemDB then -- PATCH 1179: ItemDB juga ada di upvalue 6 state.dropOk
-        local okf=rawget(b.state,"dropOk")
-        local ov=type(okf)=="function" and upvalues(okf)
-        local cand=ov and ov[6]
-        if type(cand)=="table" and type(rawget(cand,1))=="table" and rawget(rawget(cand,1),"name")~=nil then b.itemDB=cand end
     end
     local shared=RS:FindFirstChild("Shared")
     local module=shared and shared:FindFirstChild("Inventory")
@@ -393,6 +522,9 @@ local function bind(force)
     if module and ownedArity(getter,controller,0) and hasConstants(getter,{"slots","id","n"}) then
         local values=upvalues(getter)
         local inv=values and values[1]
+        if type(inv)=="table" then
+            compatibility.alias(read(inv,"room"),module,{},2)
+        end
         if type(inv)=="table" and ownedArity(read(inv,"room"),module,2)
             and ownedArity(read(inv,"count"),module,2) then
             b.inventory=inv
@@ -411,6 +543,7 @@ local function bind(force)
     end
     -- Game v1012 routes these calls through its Shared.Net adapter.
     local netCall=rawget(b.state,"call")
+    table.insert(bindingNotes,"S.call "..functionDescription(netCall).." markers="..tostring(type(netCall)=="function" and hasConstants(netCall,{"require","Shared","Net","call"})))
     if type(netCall)=="function" and ownerMatches(netCall,controller) and hasConstants(netCall,{"require","Shared","Net","call"}) then
         local ok,n,vararg=pcall(debug.info,netCall,"a")
         if ok and n==0 and vararg then
@@ -420,7 +553,22 @@ local function bind(force)
                 and captures(upvalues(take),b.state) then b.takeDrop=take end
         end
     end
-    binding=b;adapterStatus="State/drop terbaca; sinkron drop "..(b.setDropCount and "OK" or "belum cocok")
+    if not b.netCall and b.network then
+        local call=rawget(b.network,"call")
+        local cv=upvalues(call)
+        local ok,n,vararg=pcall(debug.info,call,"a")
+        table.insert(bindingNotes,"Net.call "..functionDescription(call))
+        if cv and cv[1]==b.network and ok and n==1 and vararg and hasConstants(call,{"CALLS","ask","reply"}) then
+            b.netCall=call
+        end
+    end
+    if b.netCall and not b.takeDrop then
+        local take=rawget(b.state,"takeDrop")
+        if ownedArity(take,controller,2) and hasConstants(take,{"ask","take","took","uid","want","got"})
+            and captures(upvalues(take),b.state) then b.takeDrop=take end
+    end
+    binding=b;if compatibility.onBound then compatibility.onBound(b) end
+    adapterStatus="State/drop terbaca; sinkron drop "..(b.setDropCount and "OK" or "belum cocok")
         ..", HUD gems "..(b.setGems and "OK" or "belum cocok")
         ..", backpack "..(b.inventorySync and "callback" or b.inventoryAdd and "metode native" or "belum cocok").."."
     table.insert(bindingNotes,"InventorySync "..functionDescription(b.inventorySync))
@@ -431,26 +579,16 @@ local function bind(force)
     return b
 end
 local function livePosition(b)
-    -- FIX: setiap penolakan mencatat alasannya (worldReturn.liveWhy) agar terlihat di status.
-    local function fail(why) worldReturn.liveWhy=why;return nil end
-    if not b then return fail("binding kosong") end
+    if not b then return nil end
     local x,y,world,hp=positionSnapshot(b)
-    if not x then return fail("posisi Debug/native tidak terbaca") end
-    local values=upvalues(b.positionFn)
-    if not values or not finite(values[1]) or not finite(values[2]) then return fail("posisi positionFn tidak terbaca") end
-    if math.abs(values[1]-x)>.5 or math.abs(values[2]-y)>.5 then
-        return fail(string.format("posisi Debug %.2f,%.2f beda dengan native %.2f,%.2f",x,y,values[1],values[2]))
-    end
+    local values=b and upvalues(b.positionFn)
+    if not x or not values or not finite(values[1]) or not finite(values[2]) then return nil end
+    if math.abs(values[1]-x)>.5 or math.abs(values[2]-y)>.5 then return nil end
     local s=nativeStateSnapshot(b)
-    if rawget(b.state,"ghost")==true then return fail("state ghost aktif") end
-    if rawget(b.state,"dead")==true then return fail("karakter mati") end
-    if b.stateGetter then
-        if not s then return fail("state native tidak terbaca") end
-        if s.active~=true then return fail("karakter belum aktif") end
-        if s.dead~=false then return fail("karakter masih mati") end
-        if math.abs(s.x-values[1])>.5 or math.abs(s.y-values[2])>.5 then return fail("posisi state native beda") end
-    elseif hp and hp<=0 then return fail("hp<=0") end
-    worldReturn.liveWhy=nil
+    if rawget(b.state,"ghost")==true or rawget(b.state,"dead")==true
+        or b.stateGetter and (not s or s.active~=true or s.dead~=false
+            or math.abs(s.x-values[1])>.5 or math.abs(s.y-values[2])>.5)
+        or not b.stateGetter and hp and hp<=0 then return nil end
     return values[1],values[2],world
 end
 local function inventoryNumber(b,method,id)
@@ -559,7 +697,7 @@ local function worldDrop(b,r)
     return integer(uid) and uid>=0 and integer(id) and id>0 and integer(n) and n>0
         and finite(x) and finite(y) and not rawget(r,"display")
         and typeof(frame)=="Instance" and frame:IsDescendantOf(b.camera)
-        and (id~=112 or frame:FindFirstChild("Gem")~=nil)
+        and (id~=112 or frame:FindFirstChild("Gem")~=nil or b.template~=nil and type(b.network)=="table")
 end
 local function validDrop(b,r)
     return worldDrop(b,r) and rawget(r,"armed")~=false and not rawget(r,"taking") and not rawget(r,"pending")
@@ -750,11 +888,6 @@ local function halt(reason,manual)
     pickupGate=nil
     clearPNBAnimation()
     autoLoop=nil;loopButton.Text="Siklus otomatis: OFF"
-    rp.warp=nil;rp.keepOn=false
-    if rp.phase=="visit" and not rp.shutdown then
-        rp.phase="farm";rp.visitFails=0
-        if rp.save then pcall(rp.save) end -- stop manual: jangan lanjut ke world random saat load berikutnya
-    end
     stopFarm()
     running,collecting=false,false;cycle,anchor,settings=nil,nil,nil
     generation+=1;pending=nil
@@ -804,7 +937,7 @@ local function canStart()
     local b=bind(true)
     if not b then return nil,adapterStatus end
     local x,y,world=livePosition(b)
-    if not x then return nil,"Posisi aktif/mati/ghost belum cocok ["..tostring(worldReturn.liveWhy).."]." end
+    if not x then return nil,"Posisi aktif/mati/ghost belum cocok." end
     return b,x,y,world
 end
 local function rpcFor(b,name)
@@ -827,16 +960,9 @@ local function request(p,remote,...)
             if type(remote)=="function" then return remote(table.unpack(args,1,args.n)) end
             return remote:InvokeServer(table.unpack(args,1,args.n))
         end))
-        job.done=true
-        if not job.released then job.released=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1) end
+        job.done=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
     end)
     return job
-end
--- FIX: lepas paksa request yang menggantung (server tidak menjawab setelah rejoin).
-function worldReturn.releaseJob(job)
-    if job and not job.done and not job.released then
-        job.released=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
-    end
 end
 local function measure(reply,id)
     if not reply or not reply[1] or reply.n~=2 then return nil end
@@ -1181,15 +1307,11 @@ local function guardPNBDrops(b,tx,ty)
     local list=records(b)
     local cell={x=tx,y=ty}
     local count,visited,complete,fullItem=0,0,list~=nil,nil
-    local stuck=CONFIG.stuckDrops
-    if not stuck then stuck={};CONFIG.stuckDrops=stuck end
-    local uids,important={},false
     for _,r in next,list or {} do
         visited+=1
         if visited>CONFIG.scanLimit then complete=false;break end
-        if worldDrop(b,r) and inDropCell(r,cell) and not stuck[r.uid] then
-            count+=1;table.insert(uids,r.uid)
-            if r.id~=112 then important=true end
+        if worldDrop(b,r) and inDropCell(r,cell) then
+            count+=1
             local room=r.id~=112 and inventoryNumber(b,"room",r.id)
             if room==0 or autoLoop and r.id==autoLoop.block and room and room<math.min(r.n,32) then
                 fullItem=fullItem or r
@@ -1200,11 +1322,11 @@ local function guardPNBDrops(b,tx,ty)
             end
         end
     end
-    if count==0 and complete then pickupGate=nil;if autoLoop then autoLoop.hopTries=0;autoLoop.buried=nil;autoLoop.relocTries=0 end;return false end
+    if count==0 and complete then pickupGate=nil;return false end
     local _,_,world=livePosition(b)
     local reason=count>0 and "Collecting drops from the PNB tile before placing or breaking." or "Waiting for live drop data."
     if not pickupGate or pickupGate.x~=tx or pickupGate.y~=ty or pickupGate.world~=world then
-        pickupGate={x=tx,y=ty,world=world,since=os.clock()}
+        pickupGate={x=tx,y=ty,world=world}
         log(string.format("PNB pickup guard: holding tile (%d,%d); collect and verify its drops before place/break.",tx,ty))
     end
     pickupGate.count,pickupGate.reason=count,reason
@@ -1232,79 +1354,9 @@ local function guardPNBDrops(b,tx,ty)
             return true
         end
     end
-    -- PATCH watchdog: the gate may never hold PNB/farm longer than 10s, whatever the cause
-    -- (no live drop data, endless pending pickup, unreachable drop).
-    if os.clock()-(pickupGate.since or os.clock())>10 then
-        for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
-        pickupGate=nil
-        log(string.format("PNB pickup guard: watchdog 10s on (%d,%d); releasing hold and continuing.",tx,ty))
-        return false
-    end
-    -- Gems alone are not worth waiting for; blocks and seeds are.
-    -- PATCH: drops that were buried under a re-placed block (already broken now) hop at once.
-    local waitFor=important and 4 or 1.5
-    if autoLoop and autoLoop.buried and autoLoop.buried.x==tx and autoLoop.buried.y==ty then waitFor=.8 end
-    if count>0 and complete and not pending and os.clock()-(pickupGate.since or os.clock())>waitFor then
-        local a=autoLoop
-        if important and a and farm and not a.hop and not a.paused and a.stage=="PNB" and (a.hopTries or 0)<3 then
-            -- Pickup denials are bound to the character's position, so hop to a
-            -- neighbouring tile (supported steps, as in the farm) and collect from there.
-            a.hopTries=(a.hopTries or 0)+1
-            local set={}
-            for _,uid in ipairs(uids) do set[uid]=true end
-            a.hop={cell=cell,uids=uids,set=set,tries=a.hopTries,phase="go",at=os.clock()}
-            cycle,anchor,settings=nil,nil,nil;running=false;runButton.Text="PNB: OFF"
-            a.prep=nil;a.prepare=true;a.settle=nil
-            pickupGate=nil
-            log(string.format("PNB pickup guard: blocks/seeds on (%d,%d) not collected; hop %d/3 to collect them.",tx,ty,a.hopTries))
-            return true
-        end
-        -- PATCH: hops exhausted. Do not place a new block on top of the same drops:
-        -- pick a NEW PNB position (replacePNBHome avoids every cell that holds drops).
-        if important and a and farm and not a.paused and a.stage=="PNB" and (a.relocTries or 0)<3 then
-            for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
-            a.relocTries=(a.relocTries or 0)+1
-            a.blockedHome={x=tx,y=ty};a.buried=nil
-            a.prep=nil;a.prepare=true;a.settle=nil
-            cycle,anchor,settings=nil,nil,nil;running=false;runButton.Text="PNB: OFF"
-            pickupGate=nil
-            log(string.format("PNB pickup guard: drops on (%d,%d) stuck; moving PNB to a new tile (%d/3).",tx,ty,a.relocTries))
-            return true
-        end
-        -- Drops that stay uncollected must not freeze PNB: remember them and carry on.
-        for _,uid in ipairs(uids) do stuck[uid]=os.clock() end
-        pickupGate=nil
-        log(string.format("PNB pickup guard: drops on (%d,%d) could not be collected; continuing PNB.",tx,ty))
-        return false
-    end
     startPickup(b,cell)
     if not pending and count>0 then pickupGate.reason="PNB is waiting for the tile's drops to be collected. Check pickup range and backpack space." end
     return true
-end
--- PATCH: a block is (still / again) placed on a cell that holds uncollected blocks/seeds.
--- Remember the cell: the block is broken first, then the pickup guard hops / relocates quickly.
-CONFIG.markBuried=function(b,tx,ty)
-    local a=autoLoop
-    if not a then return end
-    local now=os.clock()
-    if a.buriedScanAt and now-a.buriedScanAt<.5 then return end
-    a.buriedScanAt=now
-    local list=records(b)
-    if not list then return end
-    local stuck=CONFIG.stuckDrops or {}
-    local cell={x=tx,y=ty}
-    local visited=0
-    for _,r in next,list do
-        visited+=1
-        if visited>CONFIG.scanLimit then break end
-        if worldDrop(b,r) and r.id~=112 and inDropCell(r,cell) and not stuck[r.uid] then
-            if not a.buried or a.buried.x~=tx or a.buried.y~=ty then
-                log(string.format("PNB: uncollected drops under the block on (%d,%d); break it first, then move to collect.",tx,ty))
-            end
-            a.buried={x=tx,y=ty,at=now}
-            return
-        end
-    end
 end
 -- Four-neighbour A*: shortest route through unoccupied avatar-sized cells.
 local function gridRoute(width, height, sx, sy, gx, gy, blocked)
@@ -1425,14 +1477,19 @@ local function farmBinding(b)
     end
     if not ripe then return nil,"Kontrak treeRipe belum cocok." end
     local setTile=pv[1]
-    local tileMarkers=b.netCall and {"Net","tile","send","layer","flip","placedAt","fg","bg"}
+    local tileMarkers=b.netCall and {"require","tile","send","layer","flip","placedAt","fg","bg"}
         or {"SetTile","FireServer","placedAt","fg","bg"}
-    if not ownedArity(setTile,controller,6) or not hasConstants(setTile,tileMarkers)
-        or not captures(hv,setTile) then return nil,"Aksi plant dan harvest tidak memakai setTile yang sama." end
+    if not ownedArity(setTile,controller,6) or not (hasConstants(setTile,tileMarkers) or b.netCall and hasConstants(setTile,{"Net","tile","send","layer","flip","placedAt","fg","bg"}))
+        or not captures(hv,setTile) then
+        save("setTile "..functionDescription(setTile).." network="..tostring(not not b.netCall)
+            .." markers="..tostring(type(setTile)=="function" and hasConstants(setTile,tileMarkers))
+            .." shared="..tostring(captures(hv,setTile)))
+        return nil,"Aksi plant dan harvest tidak memakai setTile yang sama."
+    end
     local rendered=renderer and upvalues(renderer)
     b.pnbAnimation=false
     if type(debug.setupvalue)=="function" and values and rendered and values[6]==b.state and values[13]==b.itemDB
-        and values[b.netCall and 35 or 36]==hit and rendered[1]==b.state and values[21]==rendered[25]
+        and captures(values,hit) and rendered[1]==b.state and values[21]==rendered[25]
         and hasConstants(act,{"kind","build","punch","facing","punches"})
         and hasConstants(renderer,{"kind","build","punch","swingHeld"}) then
         b.pnbAnimation={act=act,render=renderer}
@@ -1442,9 +1499,17 @@ local function farmBinding(b)
     local sfxModule=shared and shared:FindFirstChild("Sfx")
     local sfx=values and values[11]
     local play=type(sfx)=="table" and rawget(sfx,"play")
-    local materials=hv[b.netCall and 17 or 18]
+    local materials
+    for _,value in pairs(hv) do
+        local palette=type(value)=="table" and rawget(value,0)
+        if type(palette)=="table" and type(rawget(palette,"hit"))=="string" and type(rawget(palette,"broke"))=="string" then
+            if materials and materials~=value then materials=nil;break end
+            materials=value
+        end
+    end
     local default=type(materials)=="table" and rawget(materials,0)
     b.pnbSound=false
+    if sfxModule and type(play)=="function" then compatibility.alias(play,sfxModule,{},nil) end
     if sfxModule and sfxModule:IsA("ModuleScript") and type(play)=="function" and ownerMatches(play,sfxModule)
         and hv[3]==sfx and pv[12]==sfx and type(default)=="table"
         and type(rawget(default,"hit"))=="string" and type(rawget(default,"broke"))=="string"
@@ -1454,20 +1519,22 @@ local function farmBinding(b)
     save("PNB sounds="..(b.pnbSound and "native Sfx.play + material palette" or "unavailable; farming actions unchanged"))
     local newCrack=rawget(b.state,"newCrack")
     local crack=ownedArity(newCrack,controller,0) and upvalues(newCrack)
-    local assets=crack and crack[2]
+    local crackOffset=crack and crack[6]==b.camera and 1 or 0
+    local assets=crack and crack[2+crackOffset]
     local atlas=type(assets)=="table" and rawget(assets,"FX")
     local image=type(atlas)=="table" and rawget(atlas,"crack")
-    local particles=hv[b.netCall and 12 or 13]
+    local particles=values[23]
+    if not captures(hv,particles) then particles=nil end
     local puff=type(particles)=="table" and read(particles,"puff")
     local particleModule=functionOwner(puff)
     b.pnbBlockEffects=false
-    if crack and type(image)=="string" and image~="" and finite(crack[3]) and crack[3]>0
-        and finite(crack[4]) and crack[4]>0 and crack[5]==b.camera
-        and hasConstants(newCrack,{"Crack","FX","crack","ImageRectSize","Pixelated"})
-        and values[23]==particles and typeof(particleModule)=="Instance" and particleModule:IsA("ModuleScript")
-        and particleModule.Name=="Particles" and particleModule:IsDescendantOf(controller.Parent)
+    if crack and type(image)=="string" and image~="" and finite(crack[3+crackOffset]) and crack[3+crackOffset]>0
+        and finite(crack[4+crackOffset]) and crack[4+crackOffset]>0 and crack[5+crackOffset]==b.camera
+        and hasConstants(newCrack,{"FX","crack","ImageRectSize","Pixelated"})
+        and values[23]==particles and typeof(particleModule)=="Instance" and (particleModule:IsA("ModuleScript") or b.network and particleModule:IsA("Script"))
+        and (particleModule.Name=="Particles" and particleModule:IsDescendantOf(b.gameGui) or b.network and particleModule.Parent==nil)
         and type(puff)=="function" and ownerMatches(puff,particleModule) then
-        b.pnbBlockEffects={image=image,atlasSize=crack[3],tileSize=crack[4],particles=particles,puff=puff}
+        b.pnbBlockEffects={image=image,atlasSize=crack[3+crackOffset],tileSize=crack[4+crackOffset],particles=particles,puff=puff}
     end
     save("PNB block effects="..(b.pnbBlockEffects and "native crack atlas + particle puff" or "unavailable; farming actions unchanged"))
     local treeHandler,trees=nil,nil
@@ -1479,80 +1546,14 @@ local function farmBinding(b)
             treeHandler,trees=callback.fn,callback.up[2]
         end
     end
-    -- PATCH 1179 v3: tabel tanaman TIDAK wajib untuk PNB. Dicari lazy; kalau belum ada pakai placeholder kosong.
-    local function locateTrees(quiet)
-        local function note(m) if not quiet then save(m) end end
-        local found,order={},{}
-        local function collect(label,fn)
-            for index,value in pairs(upvalues(fn) or {}) do
-                if type(value)=="table" and value~=b.state and value~=b.itemDB and value~=b.inventory then
-                    if not found[value] then found[value]={};table.insert(order,value) end
-                    table.insert(found[value],label.."#"..tostring(index))
-                end
-            end
-        end
-        collect("hit",hit);collect("plant",plant);collect("canPlace",canPlace);collect("ripe",ripe)
-        for _,key in ipairs({"treeLook","treeFruit","treeNear","tileChanged","remoteHit"}) do collect(key,rawget(b.state,key)) end
-        local function treeShaped(t) -- >=1 record berbentuk {p=angka}; ItemDB/tabel lain ditolak
-            local n=0
-            for _,record in next,t do
-                if type(record)~="table" or type(rawget(record,"p"))~="number" then return false end
-                n+=1
-                if n>=5 then break end
-            end
-            return n>0
-        end
-        local function sample(t)
-            local parts,n={},0
-            for key,record in next,t do
-                n+=1
-                local desc=typeof(record)
-                if type(record)=="table" then
-                    local fields,count={},0
-                    for field,value in next,record do
-                        count+=1
-                        if count<=8 then table.insert(fields,tostring(field).."="..typeof(value)) end
-                    end
-                    desc="table{"..table.concat(fields,",").."}"
-                end
-                table.insert(parts,tostring(key).."->"..desc)
-                if n>=2 then break end
-            end
-            return #parts>0 and table.concat(parts," ; ") or "(kosong)"
-        end
-        local pick
-        for _,t in ipairs(order) do
-            local shaped=treeShaped(t)
-            if not quiet then note("tree candidate via "..table.concat(found[t],",").." shaped="..tostring(shaped).." sample: "..sample(t)) end
-            if shaped then
-                if pick and pick~=t then pick=false;break end
-                pick=t
-            end
-        end
-        if pick==nil then -- world tanpa pohon: pakai tabel yang dikenali di world sebelumnya
-            local cached=env["_GenHubTrees_1179"]
-            if type(cached)=="table" and found[cached] then pick=cached;note("tree table dari cache world sebelumnya.") end
-        end
-        if pick then env["_GenHubTrees_1179"]=pick;return pick end
-        return nil
-    end
-    local treesMissing=false
-    if not trees then
-        trees=locateTrees(false)
-        if trees then treeHandler=rawget(b.state,"treeLook")
-        else
-            trees={};treesMissing=true
-            save("Tabel tanaman belum ada: PNB tetap jalan; tanam menunggu pohon pertama muncul.")
-        end
-    end
-    local gameGui=controller.Parent
+    if not trees then return nil,"Tabel tanaman aktif belum cocok." end
+    local gameGui=b.gameGui
     local module=gameGui:FindFirstChild("Others")
     local enter=rawget(b.state,"enter")
     local ev=ownedArity(enter,controller,2) and upvalues(enter)
-    local others=othersFrom(ev)
+    local others=compatibility.others(b) or ev and ev[5]
     local update=type(others)=="table" and rawget(others,"update")
     local sendHit=type(others)=="table" and rawget(others,"sendHit")
-    save("others="..typeof(others).." update="..functionDescription(update).." sendHit="..functionDescription(sendHit))
     if not module or not ownedArity(update,module,4) or not ownedArity(sendHit,module,2)
         or not hasConstants(update,{"seen","group","nameBox"}) or not hasConstants(sendHit,{"act","send","kind"}) then
         return nil,"Others untuk gerak farm belum cocok."
@@ -1562,11 +1563,6 @@ local function farmBinding(b)
         return nil,"Sender gerak native belum cocok."
     end
     local sv,hitv=upvalues(sender),upvalues(sendHit)
-    do
-        local parts={}
-        for index,value in pairs(sv or {}) do table.insert(parts,tostring(index).."="..typeof(value)) end
-        save("sender upvalues: "..table.concat(parts,", "))
-    end
     local config,net=sv and sv[1],sv and sv[5]
     if type(config)~="table" or type(net)~="table" or not hitv or hitv[1]~=net then return nil,"Identitas Net gerak berbeda." end
     local getter,solid=rawget(config,"state"),rawget(config,"solidAt")
@@ -1601,7 +1597,7 @@ local function farmBinding(b)
         and gv[3]==rendered[20] and gv[4]==rendered[21]
     save("Movement="..(glide and "supported steps; native arrival caches; no jump impulse" or "legacy goTo fallback"))
     save("Avatar collision="..(boxHits and "native boxHits" or "native-sized bounds"))
-    return {b=b,canPlace=canPlace,plant=plant,hit=hit,setTile=setTile,ripe=ripe,trees=trees,treesMissing=treesMissing,locateTrees=locateTrees,getState=getter,solid=solid,send=send,
+    return {b=b,canPlace=canPlace,plant=plant,hit=hit,setTile=setTile,ripe=ripe,trees=trees,getState=getter,solid=solid,send=send,
         rangeFn=rangeFn,buildRange=buildRange,width=width,height=height,boxHits=boxHits,glide=glide,render=renderer}
 end
 local function farmBoxHits(n,x,y)
@@ -2027,12 +2023,6 @@ local function farmClock()
     local ok,now=pcall(function() return game:GetService("Workspace"):GetServerTimeNow() end)
     return ok and type(now)=="number" and now==now and math.abs(now)<1e13 and now or nil
 end
-local function refreshTrees(n) -- PATCH 1179 v3: cari tabel tanaman lagi kalau tadinya belum ada
-    if n and n.treesMissing and n.locateTrees then
-        local ok,t=pcall(n.locateTrees,true)
-        if ok and t then n.trees=t;n.treesMissing=false;traceMotion("Tabel tanaman ditemukan.") end
-    end
-end
 local function farmTreeState(f,x,y)
     local n=f.native
     local tree=rawget(n.trees,y*n.width+x)
@@ -2065,15 +2055,6 @@ local function farmEligible(f,x,y)
         end
         if f.mode~="plant" and data.status=="ready" then return "harvest",data end
         return nil,data
-    elseif id==0 and f.mode~="harvest" and rawget(n.trees,key)~=nil then
-        -- PATCH 1179 diagnosa: petak kosong tapi dianggap ada tanaman oleh tabel n.trees
-        if (f.treeSkipLogged or 0)<12 then
-            f.treeSkipLogged=(f.treeSkipLogged or 0)+1
-            local rec=rawget(n.trees,key)
-            local fields={}
-            if type(rec)=="table" then for field,value in next,rec do if #fields<8 then table.insert(fields,tostring(field).."="..typeof(value)) end end end
-            traceMotion(string.format("SKIP tile kosong (%d,%d): n.trees[%d] terisi (%s){%s}",x,y,key,typeof(rec),table.concat(fields,",")))
-        end
     elseif id==0 and f.mode~="harvest" and (inventoryNumber(n.b,"count",f.seed) or 0)>0
         and rawget(n.trees,key)==nil then
         local below=farmTile(n,x,y+1)
@@ -2086,7 +2067,6 @@ local function farmScanStep(f)
     if f.orderMode~=f.mode then
         f.orderMode=f.mode;f.orderCursor=nil;f.scan=nil;f.candidates={}
     end
-    refreshTrees(f.native)
     local s=f.scan
     if not s then s={index=0,candidates={},empty=0,ripe=0,growing=0,unknown=0,rows={}};f.scan=s end
     local n=f.native
@@ -2296,7 +2276,7 @@ local function farmPlatformMove(f,m,dt,x,y)
     local function failed(reason,returned)
         if node and node.fromKey~=nil and node.toKey~=nil and node.fromKey~=node.toKey then
             local edge=tostring(node.fromKey)..">"..tostring(node.toKey)
-            f.motionEdges[edge]=os.clock()+(returned and 8 or 2)
+            f.motionEdges[edge]=os.clock()+(returned and 120 or 2)
             if node.kind~="walk" and node.kind~="start" then
                 local corridor="air:"..math.floor(node.fromKey/n.width)..">"..node.y..":"..math.floor(node.x/4)
                 local failures=f.motionEdges.failures or {};f.motionEdges.failures=failures
@@ -2310,11 +2290,11 @@ local function farmPlatformMove(f,m,dt,x,y)
         farmVelocity(n,0)
         f.motion=nil
         if f.target and (f.target.kind=="plant" or f.target.kind=="harvest") then
-            f.blockedOrder=f.target;f.routeRetryAt=os.clock()+.4
+            f.blockedOrder=f.target;f.routeRetryAt=os.clock()+2
             farmNote="The supported step was rejected; the first eligible tile stays selected."
             f.stepRejected=nil
             if returned then
-                f.stepRejected={x=x,y=y,reason=reason,at=os.clock()}
+                f.stepRejected={x=x,y=y,reason=reason}
                 farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
             end
         else
@@ -2546,7 +2526,6 @@ local function farmTick()
             local confirmed=a.ack
             if not confirmed and n.b.netCall and a.kind=="plant" and count==a.before-1 then
                 -- Native plant updates the tile locally. The tree record is populated separately by the game.
-                refreshTrees(n)
                 local record=rawget(n.trees,a.y*n.width+a.x)
                 confirmed=type(record)=="table" and type(rawget(record,"p"))=="number"
                     and farmTile(n,a.x,a.y)==f.seed
@@ -2595,14 +2574,11 @@ local function farmTick()
     end
     if (lease.outstanding or 0)>0 or os.clock()<(f.resumeAt or 0) then return end
     if f.stepRejected then
-        local r=f.stepRejected
-        local here=math.abs(x-r.x)<=.5 and math.abs(y-r.y)<=.5
-        if here and os.clock()-(r.at or 0)<.6 then
-            farmNote="The game returned this supported step. Retrying shortly."
+        if math.abs(x-f.stepRejected.x)<=.5 and math.abs(y-f.stepRejected.y)<=.5 then
+            farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
             return
         end
-        -- PATCH: timeout -> lepas latch dan coba rute lagi (tidak diam selamanya)
-        f.stepRejected=nil;f.routeRetryAt=nil;f.pathSearch=nil;f.motion=nil
+        f.stepRejected=nil;f.routeRetryAt=nil;f.pathSearch=nil
     end
     if n.glide and not farmStanding(n,x,y) then
         farmVelocity(n,0)
@@ -2628,13 +2604,6 @@ local function farmTick()
             local good,allowed=pcall(n.canPlace,n.b.itemDB[f.seed],t.x,t.y)
             if not good then halt("Pemeriksaan lahan native gagal.");return end
             if allowed~=true then
-                do -- PATCH 1179 diagnosa: kenapa canPlace menolak? catat tetangga, tanah, dan posisi pemain
-                    local function tid(tx,ty,layer) local v=farmTile(n,tx,ty,layer);return v==nil and "nil" or tostring(v) end
-                    local key0=t.y*n.width+t.x
-                    traceMotion(string.format("canPlace DITOLAK (%d,%d) player=%.2f,%.2f fg[kiri,tengah,kanan]=%s,%s,%s bawah=%s bg=%s trees[kiri,kanan]=%s,%s",
-                        t.x,t.y,x,y,tid(t.x-1,t.y),tid(t.x,t.y),tid(t.x+1,t.y),tid(t.x,t.y+1),tid(t.x,t.y,"bg"),
-                        typeof(rawget(n.trees,key0-1)),typeof(rawget(n.trees,key0+1))))
-                end
                 f.orderCursor=t.key;f.target=nil;f.blockedOrder=nil;f.routeRetryAt=nil
                 farmNote="The game rejected planting on this tile; checking the next eligible tile.";return
             end
@@ -2729,38 +2698,34 @@ local function startFarm(preview,internal)
     end
     f.motionEdges=f.motionEdges or {}
     if not preview then
-        local signal=remotes:FindFirstChild("TreeChanged")
-            or {OnClientEvent={Connect=function() return {Disconnect=function() end} end}} -- PATCH 1179
-        table.insert(f.connections,signal.OnClientEvent:Connect(function(tx,ty,record)
+        local function watch(name,fn)
+            local connection=compatibility.connect(b,name,fn)
+            if connection then table.insert(f.connections,connection) end
+        end
+        watch("TreeChanged",function(tx,ty,record)
             if farm~=f then return end
             local a=f.action
             if a and a.x==tx and a.y==ty then
                 if a.kind=="plant" and type(record)=="table" and type(rawget(record,"p"))=="number" then a.ack=true end
                 if a.kind=="harvest" and record==nil then a.ack=true end
             end
-        end))
+        end)
         if b.netCall then
-            local inventoryEvent=remotes:FindFirstChild("InventorySync")
-            if b.inventorySync and inventoryEvent and inventoryEvent:IsA("RemoteEvent") then
-                table.insert(f.connections,inventoryEvent.OnClientEvent:Connect(function(slots,capacity)
-                    local a=farm==f and f.action
-                    if not a or type(slots)~="table" then return end
-                    local snapshot={slots=slots,capacity=capacity or read(b.inventory,"capacity")}
-                    local reply=table.pack(true,snapshot)
-                    if not integer(snapshot.capacity) or snapshot.capacity<=0 or measure(reply,f.seed)==nil then return end
-                    local copy={}
-                    for key,slot in next,slots do copy[key]={slot[1],slot[2]} end
-                    a.inventoryReply=table.pack(true,{slots=copy,capacity=snapshot.capacity})
-                end))
-            end
-            local added=remotes:FindFirstChild("DropAdded")
-            if added and added:IsA("RemoteEvent") then
-                table.insert(f.connections,added.OnClientEvent:Connect(function(_,id,n,dx,dy)
-                    local a=farm==f and f.action
-                    if a and a.kind=="harvest" and integer(id) and finite(n) and n>0 and finite(dx) and finite(dy)
-                        and math.floor(dx)==a.x and math.floor(dy)==a.y then a.dropAck=true end
-                end))
-            end
+            if b.inventorySync then watch("InventorySync",function(slots,capacity)
+                local a=farm==f and f.action
+                if not a or type(slots)~="table" then return end
+                local snapshot={slots=slots,capacity=capacity or read(b.inventory,"capacity")}
+                local reply=table.pack(true,snapshot)
+                if not integer(snapshot.capacity) or snapshot.capacity<=0 or measure(reply,f.seed)==nil then return end
+                local copy={}
+                for key,slot in next,slots do copy[key]={slot[1],slot[2]} end
+                a.inventoryReply=table.pack(true,{slots=copy,capacity=snapshot.capacity})
+            end) end
+            watch("DropAdded",function(_,id,n,dx,dy)
+                local a=farm==f and f.action
+                if a and a.kind=="harvest" and integer(id) and finite(n) and n>0 and finite(dx) and finite(dy)
+                    and math.floor(dx)==a.x and math.floor(dy)==a.y then a.dropAck=true end
+            end)
         end
         collecting=true;collectRange=tonumber(rangeInput.Text) or CONFIG.range
         if collectRange<.5 or collectRange>20 then collectRange=CONFIG.range end
@@ -2823,17 +2788,7 @@ end
 local function updatePNB(b)
     if not running or pending or (lease.outstanding or 0)>0 or os.clock()<nextAction then return end
     if autoLoop and (autoLoop.prep or autoLoop.job) then return end
-    -- A block already on the tile is simply hit: drops lying in its cell never hold PNB.
-    -- The pickup guard only matters before the next block is placed.
-    local placed=cycle~=nil
-    if not placed and b.netCall then
-        local native=autoLoop and autoLoop.native or settings.native
-        placed=native~=nil and farmTile(native,anchor.tx,anchor.ty,settings.layer)==settings.id
-    end
-    if placed then
-        pickupGate=nil
-        CONFIG.markBuried(b,anchor.tx,anchor.ty)
-    elseif guardPNBDrops(b,anchor.tx,anchor.ty) then return end
+    if guardPNBDrops(b,anchor.tx,anchor.ty) then return end
     if not cycle then
         if os.clock()<(settings.placeAfter or 0) then return end
         local count=inventoryNumber(b,"count",settings.id)
@@ -2882,10 +2837,10 @@ local function displayBinding(b)
     local pv=ownedArity(put,b.controller,5) and upvalues(put)
     local displays=rawget(b.state,"displays")
     local get=type(displays)=="table" and rawget(displays,"get")
-    local module=b.controller.Parent:FindFirstChild("Displays")
+    local module=b.gameGui:FindFirstChild("Displays")
     local areas=rawget(b.state,"areas")
     local mayBuild=type(areas)=="table" and rawget(areas,"mayBuild")
-    local areaModule=b.controller.Parent:FindFirstChild("AreaLocks")
+    local areaModule=b.gameGui:FindFirstChild("AreaLocks")
     local remote=rpcFor(b,"DisplayItem")
     local event=remotes:FindFirstChild("DisplayChanged")
     local handler=false
@@ -2893,6 +2848,8 @@ local function displayBinding(b)
         if ownedArity(cb.fn,b.controller,3) and hasConstants(cb.fn,{"displays","set","syncDisplay"})
             and cb.up[1]==b.state then handler=true end
     end
+    if areaModule then compatibility.alias(mayBuild,areaModule,{},3) end
+    if module then compatibility.alias(get,module,{},2) end
     local permission=areaModule and ownedArity(mayBuild,areaModule,3)
     local putMarkers=pv and hasConstants(put,{"count","backpackNow","remove","object_spawn2","spawn"})
     -- The v1012 display closure calls state.call and captures its history in slot 4.
@@ -2902,6 +2859,11 @@ local function displayBinding(b)
     local getValid=module and ownedArity(get,module,2)
     local rpcValid=remote~=nil
     local eventValid=event and event:IsA("RemoteEvent")
+    if not eventValid and b.network and type(rawget(b.network,"EVENTS"))=="table"
+        and rawget(b.network.EVENTS,"DisplayChanged") then
+        event={OnClientEvent={Connect=function(_,fn) return compatibility.connect(b,"DisplayChanged",fn) end}}
+        eventValid=true
+    end
     local ok=permission and putMarkers and identity and getValid and handler and rpcValid and eventValid
     local note="displayPut "..functionDescription(put).."\nDisplays.get "..functionDescription(get)
         .."\nAreas.mayBuild "..functionDescription(mayBuild)
@@ -3149,9 +3111,8 @@ local function replacePNBHome(a,x,y)
 end
 local function startupBreak(a,x,y)
     local p,n=a.prep,a.native
+    if guardPNBDrops(n.b,p.x,p.y) then p.at=os.clock();return end
     local current=farmTile(n,p.x,p.y,p.layer)
-    -- Drops on the tile never hold a block that is already placed; it is broken first.
-    if current==a.block then pickupGate=nil;CONFIG.markBuried(n.b,p.x,p.y) end
     if current==0 then
         a.prep=nil;a.prepare=false;a.nextCheck=0;nextCollect=0
         log(string.format("BREAK AWAL: hit native selesai (%d,%d), %d pukulan; memeriksa inventory server sebelum lanjut.",p.x,p.y,p.hits))
@@ -3179,85 +3140,13 @@ local function startupBreak(a,x,y)
     p.hits+=1;p.nextAt=os.clock()+math.max(n.b.netCall and .05 or .2,a.interval)
     farmNote=string.format("BREAK AWAL %s (%d,%d), pukulan %d; belum menaruh blok baru.",p.layer,p.x,p.y,p.hits)
 end
--- Hop to a neighbouring tile and collect leftover blocks/seeds (see guardPNBDrops).
-CONFIG.hopStep=function(a,x,y)
-    local h,f=a.hop,farm
-    local function finish(ok)
-        if ok then
-            a.hopTries=0
-            log("PNB hop: leftover drops collected; continuing PNB.")
-        else
-            local stuck=CONFIG.stuckDrops
-            if not stuck then stuck={};CONFIG.stuckDrops=stuck end
-            for _,uid in ipairs(h.uids) do stuck[uid]=os.clock() end
-            log("PNB hop: leftover drops could not be collected; moving PNB to a new tile.")
-            if (a.relocTries or 0)<3 and h.cell then
-                a.relocTries=(a.relocTries or 0)+1
-                a.blockedHome={x=h.cell.x,y=h.cell.y};a.buried=nil
-            end
-        end
-        a.hop=nil
-        if f then f.target,f.motion=nil,nil end
-        a.prepare=true;a.prep=nil;a.settle=nil
-    end
-    if not f or not f.native then a.hop=nil;return end
-    a.progressAt=os.clock() -- hopping must not trip the 15s PNB progress timer
-    local n=f.native
-    if h.phase=="go" then
-        local sx,sy=math.floor(x),math.floor(y-.001)
-        local side=h.tries%2==1 and 1 or -1
-        for _,dx in ipairs({side,-side,2*side,-2*side}) do
-            local tx=sx+dx
-            if tx>=0 and tx<n.width and sy>=0 and sy<n.height and not n.solid(tx,sy) then
-                local stand={x=tx,y=sy,key=sy*n.width+tx,kind="hop"}
-                local route=farmPlan(f,stand,x,y)
-                if route then
-                    f.target,f.motion=stand,route
-                    h.stand,h.phase,h.at=stand,"move",os.clock()
-                    farmNote="Hopping to a neighbouring tile to collect leftover blocks or seeds."
-                    traceMotion(string.format("PNB HOP %d/3 -> (%d,%d)",h.tries,tx,sy))
-                    return
-                end
-            end
-        end
-        finish(false);return
-    elseif h.phase=="move" then
-        if f.motion then
-            if os.clock()-h.at>8 then finish(false) end
-            return
-        end
-        local st=h.stand
-        if math.abs(x-(st.x+.5))<=.3 and math.abs(y-(st.y+.999))<=.4 then
-            h.phase,h.at="collect",os.clock()
-            f.target=nil
-            for _,uid in ipairs(h.uids) do denied[uid]=nil;retryAt[uid]=nil end
-            nextCollect=0
-        elseif os.clock()-h.at>8 then finish(false) end
-        return
-    end
-    local list=records(n.b)
-    local left=0
-    for _,r in next,list or {} do
-        if h.set[r.uid] and worldDrop(n.b,r) then left+=1 end
-    end
-    if left==0 then finish(true);return end
-    farmNote="Collecting leftover blocks or seeds after the hop."
-    if os.clock()-h.at>3.5 then
-        if h.tries<3 then
-            a.hopTries=h.tries+1
-            a.hop={cell=h.cell,uids=h.uids,set=h.set,tries=a.hopTries,phase="go",at=os.clock()}
-        else finish(false) end
-    end
-end
 local function loopTick()
     local a,f=autoLoop,farm
     if not a or a.paused or not f or pending or f.action or f.job or f.correction or cycle then return end
     if not collecting then halt("Kolek tidak aktif; siklus dihentikan agar hasil farm tidak tertinggal.");return end
     local x,y,world=livePosition(a.native.b)
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
-    if rp.warp then farmNote="Warp ke "..rp.warp.target.." ...";return end
     if a.deposit then depositTick(a,x,y);return end
-    if a.hop then CONFIG.hopStep(a,x,y);return end
     if a.blockedHome then
         if replacePNBHome(a,x,y) then
             a.blockedHome=nil;pickupGate=nil
@@ -3284,12 +3173,10 @@ local function loopTick()
     if os.clock()>=a.nextCheck then
         request(a,rpcFor(a.native.b,"GetInventory"));return
     end
-    if rp.shouldDepart(a,world) then rp.depart(a);return end
     if a.blocks>=200 and a.stage~="PNB" then
         a.home={x=x,y=y,tx=math.floor(x),ty=math.floor(y-.475)-1};a.prepare=true;a.settle=nil
         loopStage(a,"PNB");log("STOK BLOK 200: hentikan harvest berikutnya, prioritaskan PNB.")
     end
-    if a.visit and a.seeds>=200 then rp.leaveVisit(a,"seed 200 tercapai (setor di world farm)",false);return end
     if a.seeds>=200 then
         if os.clock()<(a.nextDepositAt or 0) then farmNote="Menunggu box siap; siklus tetap ON.";return end
         if a.stage~="SETOR" then a.depositResume=a.stage end
@@ -3297,7 +3184,6 @@ local function loopTick()
     end
     if a.stage=="CEK" then
         if a.blocks>0 or a.prepare and farmTile(a.native,a.home.tx,a.home.ty,a.layer)==a.block then loopStage(a,"PNB")
-        elseif a.pnbOnly then if a.visit then rp.leaveVisit(a,"blok habis",false) else halt("Out of blocks; PNB finished.",true);report(true) end;return
         else loopStage(a,a.seeds>0 and "TANAM" or "PANEN") end
     end
     if a.stage=="PNB" then
@@ -3328,7 +3214,6 @@ local function loopTick()
                 log("BREAK AWAL: menyelaraskan petak PNB melalui hit native sebelum mulai tanam.")
                 startupBreak(a,x,y);return
             end
-            if a.pnbOnly then if a.visit then rp.leaveVisit(a,"blok habis",false) else halt("Out of blocks; PNB finished.",true);report(true) end;return end
             loopStage(a,"TANAM");return
         end
         if os.clock()-(a.progressAt or os.clock())>15 then
@@ -3426,26 +3311,12 @@ recoverLoop=function()
     local a=autoLoop;local p=a and a.paused
     if not p or os.clock()<p.retryAt then return end
     if a.rejoin then return end
-    -- FIX: watchdog. Request GetInventory yang tidak dijawab dulu membuat siklus macet selamanya.
-    if p.job and not p.job.done and os.clock()-p.job.started>=CONFIG.rpcTimeout+3 then
-        worldReturn.releaseJob(p.job);p.job=nil;p.session=false;p.snapshotStarted,p.nextSnapshot=nil,nil
-        p.retryAt=os.clock()+1;binding=nil
-        farmNote="JEDA: server belum menjawab; state & inventory dibaca ulang dari awal."
-        log(farmNote);return
-    end
-    if (lease.outstanding or 0)>0 and not (p.job and not p.job.done) then
-        p.leaseSince=p.leaseSince or os.clock()
-        if os.clock()-p.leaseSince>=15 then
-            lease.outstanding=0;p.leaseSince=nil
-            log("JEDA: permintaan server lama tidak selesai; dilepas paksa lalu dicoba ulang.")
-        end
-    else p.leaseSince=nil end
     if (lease.outstanding or 0)>0 then farmNote="JEDA: menunggu permintaan server lama selesai; siklus tetap ON.";return end
     if not p.session then
         p.retryAt=os.clock()+2
         local b,x,y,world=canStart()
         if not b then farmNote="JEDA: "..tostring(x).."; akan diperiksa ulang.";return end
-        if a.pinnedWorld and tostring(world):upper()~=tostring(a.pinnedWorld):upper() then
+        if a.pinnedWorld and world~=a.pinnedWorld then
             farmNote="Waiting for farm world "..a.pinnedWorld..". Farming will not run in another world.";return
         end
         if a.deposit and a.deposit.phase~="before" and world~=(a.deposit.world or a.world) then
@@ -3520,7 +3391,7 @@ do
         return value:upper()
     end
     local function menuEntry(b)
-        if not b or b.controller.Parent~=b.gameGui or not b.gameGui:IsDescendantOf(playerGui) then return nil end
+        if not b or not (b.controller.Parent==b.gameGui or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")) or not b.gameGui:IsDescendantOf(playerGui) then return nil end
         local module=b.gameGui:FindFirstChild("WorldMenu")
         local door=rawget(b.state,"useDoor")
         if not module or not module:IsA("ModuleScript") or not ownedArity(door,b.controller,4)
@@ -3536,6 +3407,9 @@ do
                 local enter=rawget(candidate,"enter")
                 local blocking=rawget(candidate,"blocking")
                 local ok,arity,vararg=pcall(debug.info,enter,"a")
+                if ok and not vararg and (arity==1 or arity==2) then
+                    compatibility.alias(enter,module,{},arity)
+                end
                 if ownerMatches(enter,module) and ok and not vararg and (arity==1 or arity==2)
                     and ownedArity(blocking,module,0) and hasConstants(blocking,{"Visible"}) then
                     local ev,bv=upvalues(enter),upvalues(blocking)
@@ -3543,9 +3417,10 @@ do
                     for j=1,24 do
                         local value=ev and rawget(ev,j)
                         if typeof(value)=="Instance" and value:IsA("GuiObject") then
-                            if value.Name=="WorldPicker" then
+                            if value:IsA("TextBox") then input=value
+                            else
                                 for k=1,24 do if bv and rawget(bv,k)==value then picker=value;break end end
-                            elseif value:IsA("TextBox") then input=value end
+                            end
                         end
                     end
                     local parent=picker and picker.Parent
@@ -3666,11 +3541,7 @@ do
                     a.home=nil;a.badHomes=nil;a.prep=nil;a.prepare=true;a.settle=nil
                     binding=nil;currentWorld=world
                     if farm then farm.motion,farm.target,farm.scan=nil,nil,nil;farm.pathSearch=nil;farm.candidates={} end
-                    if a.paused then
-                        worldReturn.releaseJob(a.paused.job)
-                        a.paused.session=false;a.paused.job=nil;a.paused.retryAt=0
-                    end
-                    a.resumeStage="CEK";a.nativeWorldSeen=true -- FIX: scan ulang inventory/tile sebelum lanjut
+                    if a.paused then a.paused.session=false;a.paused.job=nil;a.paused.retryAt=0 end
                     traceMotion("WORLD RETURN ready "..r.world)
                     log("Returned to "..r.world.."; refreshing game state and server inventory before farming.")
                     return false
@@ -3712,181 +3583,6 @@ do
         end)
         return true
     end
-
-    -- ===== Random-world PNB =====
-    rp.name=name
-    function rp.randomName()
-        -- Seed dari GUID unik + waktu (math.randomseed sering sama di tiap execute ulang).
-        local entropy=os.time()+os.clock()*1000003
-        local ok,guid=pcall(function() return game:GetService("HttpService"):GenerateGUID(false) end)
-        if ok and type(guid)=="string" then
-            for i=1,#guid do entropy=(entropy*31+guid:byte(i))%2147483629 end
-        end
-        local r=Random.new(math.floor(entropy))
-        local n
-        for _=1,20 do
-            local t={}
-            for i=1,r:NextInteger(6,7) do t[i]=string.char(64+r:NextInteger(1,26)) end
-            n=table.concat(t)
-            if n~=rp.lastWorld and n~=rp.farmWorld then break end
-        end
-        rp.lastWorld=n
-        return n
-    end
-    -- Lock ids: known ids + every item whose name ends with "Lock" (not "Lock of ...").
-    function rp.lockIds(b)
-        local ids={[202]=true,[204]=true,[206]=true,[242]=true,[1796]=true,[2408]=true}
-        local n=0
-        for id,def in next,b.itemDB or {} do
-            n+=1;if n>30000 then break end
-            if type(id)=="number" and type(def)=="table" then
-                local nm=rawget(def,"name")
-                if type(nm)=="string" and nm:find("%f[%a]Lock$") then ids[id]=true end
-            end
-        end
-        return ids
-    end
-    function rp.findLock(b)
-        local ids=rp.lockIds(b)
-        local w,h,fg=rawget(b.state,"w"),rawget(b.state,"h"),rawget(b.state,"fg")
-        if not integer(w) or not integer(h) or type(fg)~="table" then return nil end
-        for y=0,h-1 do
-            local row=rawget(fg,y)
-            if type(row)=="table" then
-                for x=0,w-1 do
-                    local id=rawget(row,x)
-                    if id and ids[id] then return id,x,y end
-                end
-            end
-        end
-        return nil
-    end
-    local function chatCandidates()
-        local gui=playerGui:FindFirstChild("GameGui")
-        local best,all={},{}
-        if not gui then return best,all end
-        for _,d in ipairs(gui:GetDescendants()) do
-            if d:IsA("TextBox") then
-                local full=d:GetFullName()
-                local low=full:lower()
-                local ph=tostring(read(d,"PlaceholderText") or "")
-                local lp=ph:lower()
-                table.insert(all,string.format("%s | placeholder=%s | visible=%s",full,ph,tostring(read(d,"Visible"))))
-                if not low:find("worldpicker") and (low:find("chat") or lp:find("chat") or lp:find("say") or lp:find("message")) then
-                    table.insert(best,d)
-                end
-            end
-        end
-        table.sort(best,function(a,b) return (read(a,"Visible")==true and 0 or 1)<(read(b,"Visible")==true and 0 or 1) end)
-        return best,all
-    end
-    local function dumpWarp(all,extra)
-        if type(writefile)~="function" then return end
-        local lines={"PNB RandomWorld diag | game v"..tostring(read(game,"PlaceVersion") or "?"),tostring(extra or ""),"TextBox di GameGui:"}
-        for _,l in ipairs(all) do table.insert(lines,l) end
-        table.insert(lines,"WorldRemotes:")
-        for _,c in ipairs(remotes:GetChildren()) do table.insert(lines,c.ClassName.." "..c.Name) end
-        pcall(writefile,"PNBRange_Warp.txt",table.concat(lines,"\n"))
-    end
-    local function sendChat(text,viaSignal)
-        local best,all=chatCandidates()
-        if #best==0 then dumpWarp(all,"Tidak ada TextBox chat yang cocok.");return false,"TextBox chat tidak ditemukan" end
-        local box=best[1]
-        dumpWarp(all,"Chat box dipakai: "..box:GetFullName())
-        task.spawn(function()
-            pcall(function()
-                if viaSignal and type(firesignal)=="function" then
-                    box.Text=text;firesignal(box.FocusLost,true)
-                else
-                    box:CaptureFocus();task.wait(.15);box.Text=text;task.wait(.15);box:ReleaseFocus(true)
-                end
-            end)
-        end)
-        return true
-    end
-    local function sendEnter(target)
-        local b=binding or bind(false)
-        local enter=b and menuEntry(b)
-        if not enter then return false,"WorldMenu.enter belum terverifikasi" end
-        lease.outstanding=(lease.outstanding or 0)+1
-        task.spawn(function()
-            pcall(enter,target)
-            lease.outstanding=math.max(0,(lease.outstanding or 0)-1)
-        end)
-        return true
-    end
-    function rp.beginWarp(target,why,returning,origin)
-        target=name(target or "")
-        if not target then log("Warp dibatalkan: nama world tidak valid.");return false end
-        rp.warp={target=target,why=why,returning=returning==true,origin=origin or "farm",tries=0,nextAt=os.clock()+.5}
-        rp.keepOn=true
-        farmNote="Warp ke "..target.." ("..tostring(why)..")."
-        log(farmNote);traceMotion("WARP "..target.." "..tostring(why))
-        if rp.save then pcall(rp.save) end
-        return true
-    end
-    local methods={"chat","chatsignal","enter"}
-    function rp.warpTick()
-        local w=rp.warp
-        if not w then return end
-        local _,_,world=positionSnapshot()
-        if world and name(world)==w.target then rp.warp=nil;rp.keepOn=false;return end
-        if os.clock()<w.nextAt then return end
-        w.tries+=1
-        local method=methods[(w.tries-1)%#methods+1]
-        local ok,why
-        if method=="enter" then ok,why=sendEnter(w.target)
-        else ok,why=sendChat("/warp "..w.target,method=="chatsignal") end
-        w.nextAt=os.clock()+(ok and 10 or 3)
-        log(string.format("Warp %s via %s (percobaan %d): %s",w.target,method,w.tries,ok and "terkirim" or tostring(why)))
-        if not w.returning and w.tries>=6 then
-            rp.warp=nil
-            if w.origin=="visit" then
-                rp.phase="farm";rp.visitFails=0
-                rp.beginWarp(rp.farmWorld,"warp ke world random gagal; kembali ke farm",true,"visit")
-            else
-                rp.phase="farm";rp.cooldownUntil=os.time()+300;rp.keepOn=false
-                if rp.save then pcall(rp.save) end
-                log("Warp gagal 6x; PNB lokal dipakai 5 menit. Lihat PNBRange_Warp.txt.")
-            end
-        end
-    end
-    function rp.shouldDepart(a,world)
-        if not rp.enabled or a.visit or a.warp or a.pnbOnly or rp.warp then return false end
-        if not rp.farmWorld or name(world)~=name(rp.farmWorld) then return false end
-        if os.time()<(rp.cooldownUntil or 0) then return false end
-        if (a.blocks or 0)<=0 or (a.seeds or 0)>=200 or a.deposit then return false end
-        if a.stage=="CEK" then return true end
-        if (a.blocks or 0)>=200 and (a.stage=="TANAM" or a.stage=="PANEN" or a.stage=="TUNGGU") then return true end
-        return a.stage=="PNB" and not running and not pending and not a.prep and not a.hop
-            and not a.heldPNB and not pickupGate
-    end
-    function rp.depart(a)
-        rp.phase="visit";rp.visitFails=0
-        rp.beginWarp(rp.randomName(),"PNB di world random ("..tostring(a.blocks).." blok)",false,"farm")
-    end
-    -- failed=true: world tidak bisa dipakai (lock / tidak ada petak PNB) -> coba world random lain (maks 3x).
-    function rp.leaveVisit(a,why,failed)
-        if rp.warp then return end
-        local target
-        if failed then
-            rp.visitFails=(rp.visitFails or 0)+1
-            if rp.visitFails<3 then rp.phase="visit";target=rp.randomName()
-            else rp.visitFails=0;rp.phase="farm";rp.cooldownUntil=os.time()+300;target=rp.farmWorld end
-        else rp.visitFails=0;rp.phase="farm";target=rp.farmWorld end
-        log("Keluar dari world ini: "..tostring(why))
-        if not rp.beginWarp(target,why,target==rp.farmWorld,"visit") then halt("Farm World belum diisi.",true) end
-    end
-    function rp.visitWatch()
-        local a=autoLoop
-        if not a or not a.visit or rp.warp or rp.shutdown then return end
-        if a.paused then
-            if a.visitPausedRef~=a.paused then a.visitPausedRef=a.paused;a.visitPauses=(a.visitPauses or 0)+1 end
-            if os.clock()-(a.paused.at or os.clock())>45 or (a.visitPauses or 0)>=5 then
-                rp.leaveVisit(a,"tidak bisa PNB di world ini: "..tostring(a.paused.reason):sub(1,80),true)
-            end
-        end
-    end
 end
 onAction(loopButton,function()
     if autoLoop then halt("Siklus otomatis OFF.",true);report(true);return end
@@ -3896,11 +3592,10 @@ onAction(loopButton,function()
         log("Isi Item ID blok, Pukul 1-50, Jeda 0.05-5 detik.");report(true);return
     end
     local a={block=id,seed=id+1,hits=hits,interval=interval,stage="JEDA",nextCheck=0,deposits=0,prepare=true,
-        progressAt=os.clock(),pnbOnly=CONFIG.pnbOnly==true,paused={reason="Mulai",retryAt=0,at=os.clock()}}
+        progressAt=os.clock(),paused={reason="Mulai",retryAt=0,at=os.clock()}}
     autoLoop=a;loopButton.Text="Siklus otomatis: ON"
     recoverLoop()
-    log(a.pnbOnly and "PNB ON: place & break + kolek otomatis dari siklus; tanpa tanam/panen; berhenti saat blok habis."
-        or "SIKLUS ON: PNB -> TANAM satu per satu -> PANEN satu per satu -> PNB; tetap ON sampai dihentikan manual.");report(true)
+    log("SIKLUS ON: PNB -> TANAM satu per satu -> PANEN satu per satu -> PNB; tetap ON sampai dihentikan manual.");report(true)
 end)
 onAction(layerButton,function()
     if autoLoop then log("Layer PNB mengikuti jenis blok native; Stop dahulu untuk menggantinya secara manual.");return end
@@ -3960,7 +3655,7 @@ onAction(runButton,function()
 end)
 local function cleanup(destroying)
     if not alive then return end
-    rp.shutdown=true;halt("Panel ditutup; semua aksi baru dihentikan.",true);report(true);alive=false
+    halt("Panel ditutup; semua aksi baru dihentikan.",true);report(true);alive=false
     for _,connection in ipairs(connections) do connection:Disconnect() end
     if rayfieldUI and rayfieldUI.Destroy then pcall(rayfieldUI.Destroy) end
     rayfieldUI=nil
@@ -3976,19 +3671,30 @@ end)
 connect(Input.WindowFocusReleased,function()
     if farm and not farm.preview then
         log("Auto Farm tetap aktif di latar; Stop/H untuk menghentikan.");report(true)
-    else halt("PNB/kolek OFF.");report(true) end
+    else halt("Roblox kehilangan fokus; PNB/kolek OFF.");report(true) end
 end)
-local moveRemote=remotes:FindFirstChild("MoveTo")
-if moveRemote then connect(moveRemote.OnClientEvent,farmServerMoved) end
-local worldClosed=remotes:FindFirstChild("WorldClosed")
-if worldClosed then connect(worldClosed.OnClientEvent,function()
-    if autoLoop then worldReturn.begin() else halt("World ditutup; PNB/kolek OFF.");binding=nil end
-    report(true)
-end) end
+compatibility.onBound=function(b)
+    local registry=compatibility.registries[b.controller]
+    if registry then return end
+    registry={};compatibility.registries[b.controller]=registry
+    local named=remotes:FindFirstChild("MoveTo")
+    if named and compatibility.namedEvents then return end
+    if named then compatibility.namedEvents=true end
+    local moved=compatibility.connect(b,"MoveTo",farmServerMoved)
+    if moved then table.insert(connections,moved) end
+    local closed=compatibility.connect(b,"WorldClosed",function()
+        if autoLoop then worldReturn.begin() else halt("World ditutup; PNB/kolek OFF.");binding=nil end
+        report(true)
+    end)
+    if closed then table.insert(connections,closed) end
+end
+-- Old versions expose named events before a binding is established.
+if not binding then
+    local b={controller=remotes}
+    compatibility.onBound(b)
+end
 connect(RunService.Heartbeat,function()
     if not alive then return end
-    if rp.warp then rp.warpTick() end
-    rp.visitWatch()
     if worldReturn.tick() then
         if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
         return
@@ -4036,36 +3742,34 @@ connect(RunService.Heartbeat,function()
     end
     if os.clock()>=nextUI then nextUI=os.clock()+.2;report(false) end
 end)
--- Anti AFK (VirtualUser). Ikut mati saat panel ditutup; tidak menumpuk saat execute ulang.
-do
-    local okVU,VirtualUser=pcall(function() return game:GetService("VirtualUser") end)
-    if okVU and VirtualUser then
-        local token={}
-        env._GenHubAntiAFK=token
-        local function fakeActivity()
-            if not alive or env._GenHubAntiAFK~=token then return end
-            pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton2(Vector2.new(math.random(100,800),math.random(100,500)))
-                VirtualUser:CaptureController()
-                VirtualUser:SetKeyDown("s")
-                task.wait(0.2)
-                VirtualUser:SetKeyUp("s")
-            end)
-        end
-        task.spawn(function()
-            while alive and env._GenHubAntiAFK==token do
-                task.wait(math.random(480,900)) -- 8-15 menit
-                fakeActivity()
-            end
-        end)
-        connect(player.Idled,fakeActivity)
-    end
-end
 bind(true)
 -- BEGIN PNB RAYFIELD UI
 -- Bundled by tools/build_rayfield_ui.py. Configuration never starts farming.
 local function installRayfield()
+    -- The original logo is a separate immutable PNG, cached in the executor workspace.
+local function genhubLogoAsset()
+    local custom=type(getcustomasset)=="function" and getcustomasset or type(getsynasset)=="function" and getsynasset
+        or type(rawget(env,"getcustomasset"))=="function" and rawget(env,"getcustomasset")
+        or type(rawget(env,"getsynasset"))=="function" and rawget(env,"getsynasset")
+    if not custom then return nil end
+    local filename="GenHub_Logo_ef26c494a3a5.png"
+    local function valid(data)
+        return type(data)=="string" and #data==731332 and data:sub(1,8)=="\137PNG\13\10\26\10"
+    end
+    local ok,bytes
+    if type(readfile)=="function" then ok,bytes=pcall(readfile,filename) end
+    if not ok or not valid(bytes) then
+        if type(writefile)~="function" then return nil end
+        ok,bytes=pcall(function()
+            return game:HttpGet("https://pnb-key-service.key-service.workers.dev/assets/genhub-logo-ef26c494a3a5.png")
+        end)
+        if not ok or not valid(bytes) then return nil end
+        if not pcall(writefile,filename,bytes) then return nil end
+    end
+    local loaded,uri=pcall(custom,filename)
+    return loaded and type(uri)=="string" and uri~="" and uri or nil
+end
+
     local bundledSource=[=====[
 --[[
 
@@ -6348,6 +6052,53 @@ local function fadeOutKeyUI(KeyMain)
 end
 
 function RayfieldLibrary:CreateWindow(Settings)
+    -- Replace the startup artwork before the upstream splash can become visible.
+    do
+        local image=type(Settings.BrandingImage)=="string" and Settings.BrandingImage~="" and Settings.BrandingImage or nil
+        local function create(class,props,parent)
+            local object=Instance.new(class)
+            for key,value in pairs(props) do object[key]=value end
+            object.Parent=parent;return object
+        end
+        local function logo(parent,name,size,position,anchor)
+            return create("ImageLabel",{Name=name,BackgroundTransparency=1,Image=image or "",Visible=image~=nil,
+                ImageTransparency=0,ImageColor3=Color3.fromRGB(255,255,255),ScaleType=Enum.ScaleType.Fit,
+                ImageRectOffset=Vector2.new(0,0),ImageRectSize=Vector2.new(0,0),
+                Size=size,Position=position,AnchorPoint=anchor},parent)
+        end
+        local splash=Rayfield:FindFirstChild("Loading")
+        if splash then
+            for _,child in ipairs(splash:GetChildren()) do
+                if child:IsA("GuiObject") then child.Visible=false end
+            end
+            local group=create("Frame",{Name="GenHubSplash",BackgroundTransparency=1,Size=UDim2.fromOffset(276,84),
+                Position=UDim2.new(.5,0,.5,0),AnchorPoint=Vector2.new(.5,.5)},splash)
+            logo(group,"GenHubLogo",UDim2.fromOffset(84,84),UDim2.fromOffset(0,0),Vector2.new(0,0))
+            create("TextLabel",{Name="GenHubTitle",Text="GenHub",TextSize=36,Font=Enum.Font.GothamSemibold,
+                TextColor3=Color3.fromRGB(255,255,255),BackgroundTransparency=1,
+                TextXAlignment=image and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center,
+                Size=UDim2.new(1,image and -102 or 0,1,0),Position=UDim2.fromOffset(image and 102 or 0,0)},group)
+        end
+        local previous=LoadingFrame:FindFirstChild("GenHubLogo")
+        if previous then previous:Destroy() end
+        logo(LoadingFrame,"GenHubLogo",UDim2.fromOffset(56,56),UDim2.new(0,22,.5,0),Vector2.new(0,.5))
+        local inset=image and 92 or 26
+        LoadingFrame.Title.Position=UDim2.new(0,inset,.5,-10)
+        LoadingFrame.Subtitle.Position=UDim2.new(0,inset,.5,9)
+        LoadingFrame.Title.AnchorPoint=Vector2.new(0,.5)
+        LoadingFrame.Subtitle.AnchorPoint=Vector2.new(0,.5)
+        LoadingFrame.Title.Size=UDim2.new(1,-inset-18,0,22)
+        LoadingFrame.Subtitle.Size=UDim2.new(1,-inset-18,0,18)
+        local icon=Topbar:FindFirstChild("Icon")
+        if icon then
+            icon.Visible=image~=nil;icon.Image=image or ""
+            icon.ImageRectOffset=Vector2.new(0,0);icon.ImageRectSize=Vector2.new(0,0)
+            icon.ImageColor3=Color3.fromRGB(255,255,255);icon.ImageTransparency=0
+            icon.ScaleType=Enum.ScaleType.Fit
+            if image then Topbar.Title.Position=UDim2.new(0,47,.5,0) end
+        end
+    end
+
 	if Rayfield:FindFirstChild('Loading') then
 		if getgenv and not getgenv().rayfieldCached then
 			Rayfield.Enabled = true
@@ -6410,7 +6161,7 @@ function RayfieldLibrary:CreateWindow(Settings)
 	LoadingFrame.Subtitle.Text = Settings.LoadingSubtitle or "Interface Suite"
 
 	if Settings.LoadingTitle ~= "Rayfield Interface Suite" then
-		LoadingFrame.Version.Text = "Rayfield UI"
+		LoadingFrame.Version.Text = Settings.LoadingVersion or "GenHub 1.9.2"
 	end
 
 	if Settings.Icon and Settings.Icon ~= 0 and Topbar:FindFirstChild('Icon') then
@@ -8411,6 +8162,12 @@ function RayfieldLibrary:CreateWindow(Settings)
 	TweenService:Create(LoadingFrame.Title, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
 	TweenService:Create(LoadingFrame.Subtitle, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
 	TweenService:Create(LoadingFrame.Version, TweenInfo.new(0.2, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
+    -- Upstream fades only its text; remove the added image before the tabs open.
+    do
+        local logo=LoadingFrame:FindFirstChild("GenHubLogo")
+        if logo then logo:Destroy() end
+    end
+
 	task.wait(0.1)
 	TweenService:Create(Main, TweenInfo.new(0.6, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = useMobileSizing and UDim2.new(0, 500, 0, 275) or UDim2.new(0, 500, 0, 475)}):Play()
 	TweenService:Create(Main.Shadow.Image, TweenInfo.new(0.5, Enum.EasingStyle.Exponential), {ImageTransparency = 0.6}):Play()
@@ -8506,6 +8263,123 @@ function RayfieldLibrary:CreateWindow(Settings)
 			})
 		--end
 	end
+
+    -- An owned community control, separate from Rayfield's Discord RPC integration.
+    do
+        local invite=Settings.CommunityInvite
+        if type(invite)=="string" and invite:match("^https://discord%.gg/[%w%-]+$") then
+            local links={}
+            local function watch(signal,callback)
+                links[#links+1]=signal:Connect(callback)
+            end
+            local function create(class,props,parent)
+                local object=Instance.new(class)
+                for key,value in pairs(props) do object[key]=value end
+                object.Parent=parent;return object
+            end
+            local function round(object,radius)
+                create("UICorner",{CornerRadius=UDim.new(0,radius)},object)
+            end
+            local white=Color3.fromRGB(255,255,255)
+            local accent=Color3.fromRGB(88,101,242)
+            -- Preserve the tab row's left edge even when it is center anchored.
+            local size,position=TabList.Size,TabList.Position
+            TabList.Size=UDim2.new(size.X.Scale,size.X.Offset-100,size.Y.Scale,size.Y.Offset)
+            TabList.Position=UDim2.new(position.X.Scale,position.X.Offset-100*TabList.AnchorPoint.X,
+                position.Y.Scale,position.Y.Offset)
+            local button=create("TextButton",{Name="GenHubDiscord",Text="Discord",TextSize=13,
+                Font=Enum.Font.GothamMedium,TextColor3=white,BackgroundColor3=accent,
+                BorderSizePixel=0,AutoButtonColor=true,Visible=false,ZIndex=15,
+                AnchorPoint=Vector2.new(1,TabList.AnchorPoint.Y),Size=UDim2.fromOffset(86,32),
+                Position=UDim2.new(1,-18,position.Y.Scale,position.Y.Offset)},Main)
+            round(button,16)
+            local panel=create("Frame",{Name="GenHubCommunity",Visible=false,Active=true,
+                BorderSizePixel=0,ZIndex=40,AnchorPoint=Vector2.new(1,0),
+                Size=UDim2.new(1,-36,0,178),Position=UDim2.new(1,-18,0,96)},Main)
+            create("UISizeConstraint",{MaxSize=Vector2.new(300,178)},panel)
+            round(panel,12)
+            local stroke=create("UIStroke",{Thickness=1,Transparency=.2},panel)
+            local title=create("TextLabel",{Name="Title",Text="GenHub Discord",TextSize=16,
+                Font=Enum.Font.GothamSemibold,BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,
+                Position=UDim2.fromOffset(14,13),Size=UDim2.new(1,-56,0,24),ZIndex=41},panel)
+            local close=create("TextButton",{Name="Close",Text="×",TextSize=22,Font=Enum.Font.Gotham,
+                BackgroundTransparency=1,BorderSizePixel=0,Position=UDim2.new(1,-38,0,10),
+                Size=UDim2.fromOffset(28,28),ZIndex=42},panel)
+            local description=create("TextLabel",{Name="Description",TextSize=12,Font=Enum.Font.Gotham,
+                BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,
+                Position=UDim2.fromOffset(14,42),Size=UDim2.new(1,-28,0,32),ZIndex=41},panel)
+            local url=create("TextBox",{Name="Invite",Text=invite,TextSize=12,Font=Enum.Font.Gotham,
+                ClearTextOnFocus=false,TextEditable=false,TextXAlignment=Enum.TextXAlignment.Center,
+                BorderSizePixel=0,Position=UDim2.fromOffset(14,82),Size=UDim2.new(1,-28,0,28),ZIndex=41},panel)
+            round(url,6)
+            local join=create("TextButton",{Name="JoinServer",Text="Join Server",TextSize=13,
+                Font=Enum.Font.GothamSemibold,TextColor3=white,BackgroundColor3=accent,AutoButtonColor=true,
+                BorderSizePixel=0,Position=UDim2.fromOffset(14,124),Size=UDim2.new(1,-28,0,36),ZIndex=41},panel)
+            round(join,8)
+            local function reset()
+                join.Text="Join Server"
+                description.Text="Get updates and support from the community."
+            end
+            local function theme()
+                panel.BackgroundColor3=SelectedTheme.ElementBackground or SelectedTheme.Background
+                stroke.Color=SelectedTheme.ElementStroke
+                title.TextColor3=SelectedTheme.TextColor;close.TextColor3=SelectedTheme.TextColor
+                description.TextColor3=SelectedTheme.TextColor;description.TextTransparency=.2
+                url.TextColor3=SelectedTheme.TextColor
+                url.BackgroundColor3=SelectedTheme.Background
+            end
+            local function refresh()
+                local available=not rayfieldDestroyed and Rayfield.Enabled and Main.Visible and TabList.Visible
+                    and not Hidden and not Minimised and not searchOpen and Main.Size.Y.Offset>160
+                button.Visible=available
+                if not available then panel.Visible=false end
+            end
+            local function copyInvite()
+                local candidates={}
+                local function add(fn) if type(fn)=="function" then candidates[#candidates+1]=fn end end
+                add(setclipboard);add(toclipboard)
+                if type(syn)=="table" then add(syn.write_clipboard) end
+                if type(getgenv)=="function" then
+                    local ok,environment=pcall(getgenv)
+                    if ok and type(environment)=="table" then
+                        add(environment.setclipboard);add(environment.toclipboard)
+                        if type(environment.syn)=="table" then add(environment.syn.write_clipboard) end
+                    end
+                end
+                for _,copy in ipairs(candidates) do
+                    local ok,result=pcall(copy,invite)
+                    if ok and result~=false then return true end
+                end
+                return false
+            end
+            watch(button.Activated,function()
+                refresh()
+                if button.Visible then reset();panel.Visible=not panel.Visible end
+            end)
+            watch(close.Activated,function() panel.Visible=false end)
+            watch(join.Activated,function()
+                refresh()
+                if not button.Visible or not panel.Visible then return end
+                if copyInvite() then
+                    join.Text="Link Copied"
+                    description.Text="Invite link copied. Paste it in Discord to join."
+                else
+                    join.Text="Copy Invite"
+                    description.Text="Clipboard unavailable. Select and copy the invite below."
+                end
+            end)
+            watch(url.Focused,function() url.SelectionStart=1;url.CursorPosition=#invite+1 end)
+            for _,entry in ipairs({{Rayfield,"Enabled"},{Main,"Visible"},{Main,"Size"},
+                {TabList,"Visible"},{Main.Search,"Visible"},{Main.Search.Input,"Interactable"}}) do
+                watch(entry[1]:GetPropertyChangedSignal(entry[2]),refresh)
+            end
+            watch(Main:GetPropertyChangedSignal("BackgroundColor3"),theme)
+            Rayfield.Destroying:Connect(function()
+                for _,connection in ipairs(links) do connection:Disconnect() end
+            end)
+            reset();theme();refresh()
+        end
+    end
 
 	return Window
 end
@@ -15807,18 +15681,114 @@ return RayfieldLibrary
     assert(type(library)=="table" and type(library.CreateWindow)=="function","Rayfield could not be loaded.")
     local defaultScale=Input.TouchEnabled and 75 or 100
     local ui={library=library,updating=false,ready=false,query="",page=1,pageSize=80,rows={},byId={},options={},
-        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,configStatus="No saved configuration."}
+        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,configStatus="No saved configuration."}
     rayfieldUI=ui
+        -- Local nameplate visibility only; the game's player identity stays intact.
+    do
+        local enabled,destroyed,pending=false,false,false
+        local active,addedConnection
+        local function isGui(object,class)
+            local ok,result=pcall(function() return object:IsA(class or "GuiObject") end)
+            return ok and result
+        end
+        local function localTag()
+            local gui=playerGui:FindFirstChild("GameGui")
+            local world=gui and gui:FindFirstChild("World")
+            local camera=world and world:FindFirstChild("Camera")
+            local tag=camera and camera:FindFirstChild("NameTag")
+            if not isGui(tag,"Frame") and binding and binding.template and binding.gameGui==gui then
+                local values=type(binding.renderer)=="function" and upvalues(binding.renderer)
+                local nativeTag,bitmap=values and values[76],values and values[77]
+                local frame=type(bitmap)=="table" and rawget(bitmap,"frame")
+                if isGui(nativeTag,"Frame") and nativeTag.Parent==binding.camera and isGui(frame)
+                    and frame.Parent==nativeTag and type(rawget(bitmap,"redraw"))=="function" then tag=nativeTag end
+            end
+            return isGui(tag,"Frame") and tag or nil
+        end
+        local function nameFrame(tag)
+            if not tag then return nil end
+            local found
+            local values=binding and type(binding.renderer)=="function" and upvalues(binding.renderer)
+            for _,value in pairs(values or {}) do
+                if type(value)=="table" and type(rawget(value,"redraw"))=="function" then
+                    local frame=rawget(value,"frame")
+                    if isGui(frame) and read(frame,"Parent")==tag and frame.Name~="Flag" and frame.Name~="Wrench" then
+                        if found and found~=frame then return nil end
+                        found=frame
+                    end
+                end
+            end
+            if found then return found end
+            -- The native container holds one bitmap text frame, Flag and Wrench.
+            -- If the structure is ambiguous, leave it intact until it is known.
+            for _,child in ipairs(tag:GetChildren()) do
+                if isGui(child,"Frame") and child.Name~="Flag" and child.Name~="Wrench" then
+                    if found then return nil end
+                    found=child
+                end
+            end
+            return found
+        end
+        local function release()
+            local previous=active;active=nil
+            if not previous then return end
+            for _,connection in ipairs(previous.connections) do connection:Disconnect() end
+            pcall(function() previous.frame.Visible=previous.visible end)
+        end
+        local function refresh()
+            if not enabled or destroyed then return end
+            local tag=localTag()
+            local frame=nameFrame(tag)
+            if active and active.frame~=frame then release() end
+            if not frame or active then return end
+            local saved={frame=frame,visible=frame.Visible,connections={}}
+            active=saved
+            saved.connections[#saved.connections+1]=frame:GetPropertyChangedSignal("Visible"):Connect(function()
+                if enabled and active==saved and frame.Visible then frame.Visible=false end
+            end)
+            saved.connections[#saved.connections+1]=frame:GetPropertyChangedSignal("Parent"):Connect(refresh)
+            frame.Visible=false
+        end
+        local function queueRefresh(object)
+            if not enabled or destroyed or pending then return end
+            local parent=read(object,"Parent")
+            if object.Name~="GameGui" and object.Name~="World" and object.Name~="Camera" and object.Name~="NameTag"
+                and not (parent and parent.Name=="NameTag") then return end
+            pending=true
+            local function run()
+                pending=false;refresh()
+            end
+            if type(task.defer)=="function" then task.defer(run) else run() end
+        end
+        local function set(value)
+            if destroyed then return end
+            enabled=value==true
+            if not enabled then
+                if addedConnection then addedConnection:Disconnect();addedConnection=nil end
+                release();return
+            end
+            if not addedConnection then
+                addedConnection=playerGui.DescendantAdded:Connect(queueRefresh)
+            end
+            refresh()
+        end
+        ui.usernamePrivacy={Set=set,Refresh=refresh,Destroy=function()
+            set(false);destroyed=true
+        end}
+    end
+
     ui.Destroy=function()
         ui.ready=false
+        ui.usernamePrivacy.Destroy()
         if type(library.Destroy)=="function" then library:Destroy() end
     end
-    local window=library:CreateWindow({Name="GenHub 1.9.3",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
+    ui.logoAsset=genhubLogoAsset()
+    local window=library:CreateWindow({Name="GenHub 1.9.2",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
+        LoadingVersion="GenHub 1.9.2",BrandingImage=ui.logoAsset,CommunityInvite="https://discord.gg/jZ4xTfbg5J",
         Theme="Ocean",Icon=0,ToggleUIKeybind=Enum.KeyCode.RightControl,
         DisableRayfieldPrompts=true,DisableBuildWarnings=true,
         ConfigurationSaving={Enabled=false,FileName="PNB_Farmable"},Discord={Enabled=false},KeySystem=false})
     local main=window:CreateTab("Farm",0)
-    local pnbTab=window:CreateTab("PNB",0)
     local settingsTab=window:CreateTab("Settings",0)
     local statusTab=window:CreateTab("Status",0)
     local reference={}
@@ -15877,33 +15847,8 @@ return RayfieldLibrary
     main:CreateButton({Name="Next Page",Callback=function() ui.page=math.min(ui.pages or 1,ui.page+1);ui.Search() end})
     local selectedTarget=main:CreateParagraph({Title="Selected Target",Content="Select a block above. Its seed is selected automatically."})
     local cycleToggle=main:CreateToggle({Name="Start Farm",CurrentValue=false,Callback=function(value)
-        local farmOn=autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)
-        if ui.updating or value==farmOn then return end
-        if autoLoop and autoLoop.pnbOnly and not autoLoop.visit then notify("Stop PNB (PNB tab) before starting the farm cycle.");ui.Sync(true);return end
+        if ui.updating or value==(autoLoop~=nil) then return end
         dispatch("AutoCycle")
-    end})
-    local farmWorldInput=main:CreateInput({Name="Farm World",CurrentValue="",PlaceholderText="Nama world farm (kembali ke sini)",
-        RemoveTextAfterFocusLost=false,Callback=function(value)
-            if ui.updating then return end
-            if busy() then notify("Stop the cycle before changing the Farm World.");ui.Sync(true);return end
-            local text=tostring(value):match("^%s*(.-)%s*$")
-            if text=="" then rp.farmWorld=nil;ui.Sync(true);return end
-            local n=rp.name(text)
-            if not n then notify("Nama world hanya boleh huruf, angka, _ atau -.");ui.Sync(true);return end
-            rp.farmWorld=n;log("Farm World: "..n)
-            ui.Sync(true);report(true)
-        end})
-    local randomToggle=main:CreateToggle({Name="PNB in Random World",CurrentValue=false,Callback=function(value)
-        if ui.updating or value==rp.enabled then return end
-        if value and not rp.farmWorld then
-            local _,_,w=positionSnapshot()
-            local n=w and rp.name(w)
-            if not n then notify("Isi Farm World dahulu.");ui.Sync(true);return end
-            rp.farmWorld=n;notify("Farm World diisi otomatis: "..n)
-        end
-        rp.enabled=value
-        log("PNB in Random World: "..(value and "ON" or "OFF"))
-        ui.Sync(true);report(true)
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
     main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
@@ -15930,36 +15875,23 @@ return RayfieldLibrary
         if not finite(data.range) or data.range<.5 or data.range>20 then return nil,"Collect Radius must be between 0.5 and 20 tiles." end
         local filter=normalizeFilter(data.collectFilter)
         if not filter then return nil,"Use ALL or up to 32 item IDs separated by commas." end
-        for _,key in ipairs({"farmOn","pnbOn"}) do
-            if data[key]~=nil and type(data[key])~="boolean" then return nil,"Toggle settings must be on or off." end
-        end
         for _,key in ipairs({"soundEffects","handAnimations","blockEffects"}) do
             if data[key]~=nil and type(data[key])~="boolean" then return nil,"Effect settings must be on or off." end
         end
+        if data.hideUsername~=nil and type(data.hideUsername)~="boolean" then return nil,"Hide Username must be on or off." end
         local scale=data.uiScale==nil and defaultScale or data.uiScale
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
-        local pnbId=integer(data.pnbId) and data.pnbId>0 and data.pnbId or nil
-        return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,pnbId=pnbId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
+        return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
-            farmOn=data.farmOn==true,pnbOn=data.pnbOn==true,
-            randomPnb=data.randomPnb==true,
-            farmWorld=type(data.farmWorld)=="string" and rp.name(data.farmWorld) or nil,
-            phase=data.phase=="visit" and "visit" or "farm",
-            lastWorld=type(data.lastWorld)=="string" and rp.name(data.lastWorld) or nil,
-            visitFails=integer(data.visitFails) and math.clamp(data.visitFails,0,10) or 0,
-            cooldownUntil=type(data.cooldownUntil)=="number" and data.cooldownUntil>0 and data.cooldownUntil<4e9
-                and math.floor(data.cooldownUntil) or 0}
+            hideUsername=data.hideUsername==true}
     end
     local function currentConfig()
-        return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),pnbId=ui.pnbId,hits=tonumber(hitsInput.Text),
+        return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
-            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,
-            farmOn=(autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)) or rp.keepOn==true,
-        pnbOn=autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit,
-        randomPnb=rp.enabled,farmWorld=rp.farmWorld,phase=rp.phase,lastWorld=rp.lastWorld,visitFails=rp.visitFails,cooldownUntil=rp.cooldownUntil})
+            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername})
     end
-    local function settingInput(title,control,hint,tab)
-        local widget=(tab or settingsTab):CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
+    local function settingInput(title,control,hint)
+        local widget=settingsTab:CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
             Callback=function(value)
                 if ui.updating then return end
                 if busy() then notify("Stop the cycle before changing settings.");ui.Sync(true);return end
@@ -15971,6 +15903,11 @@ return RayfieldLibrary
         table.insert(inputMirrors,{widget=widget,control=control})
     end
     settingsTab:CreateSection("Interface")
+    local privacyToggle=settingsTab:CreateToggle({Name="Hide Username",CurrentValue=false,Callback=function(value)
+        if ui.updating then return end
+        ui.hideUsername=value==true;ui.usernamePrivacy.Set(ui.hideUsername)
+        ui.Sync(true)
+    end})
     local scaleInfo=settingsTab:CreateParagraph({Title="Window Size",Content="Drag the bottom-right corner to resize the window."})
     local function syncScaleInfo()
         paragraph(scaleInfo,"Window Size",string.format("Preferred: %.0f%% | On screen: %.0f%%\nDrag the bottom-right corner to resize. Save Config remembers your size.",ui.uiScale,library:GetUIScale()))
@@ -16002,93 +15939,6 @@ return RayfieldLibrary
     settingInput("Action Delay (seconds)",delayInput,"0.05–5")
     settingInput("Collect Radius (tiles)",rangeInput,"0.5–20")
     settingInput("Collect Filter",filterInput,"ALL or comma-separated item IDs")
-    -- BEGIN PNB TAB: runs the Farm cycle's proven PNB stage on its own (pnbOnly):
-    -- no planting, no harvesting. Same home selection, startup break, drop guard,
-    -- recovery and seed storage as Start Farm.
-    local function pnbBlockInfo(id)
-        if not integer(id) or id<=0 then return nil,"Enter a whole-number Block ID." end
-        local def=ui.db and entry(ui.db,id)
-        if ui.db and type(def)~="table" then return nil,"Block ID "..id.." does not exist in this game." end
-        if type(def)=="table" and rawget(def,"kind")=="seed" then return nil,"Item "..id.." is a seed. Enter the block ID instead." end
-        if ui.db and not pair(ui.db,id) then return nil,"Block "..id.." has no seed pair (ID+1) in this game; the PNB cycle tracks seeds." end
-        return nativeName(ui.db,id,reference[id])
-    end
-    -- Runs a panel action. AutoCycle reads the Item ID box, so it is borrowed for the
-    -- call and restored; the Farm tab's target is never changed.
-    local function runAction(name,idOverride)
-        local action=uiActions[name]
-        if not action then return end
-        local saved=idInput.Text
-        if idOverride then idInput.Text=tostring(idOverride) end
-        local ok,why=pcall(action)
-        idInput.Text=saved
-        if not ok then halt("UI action failed: "..tostring(why)) end
-    end
-    local function pnbActive() return autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit end
-    local pnbInput=pnbTab:CreateInput({Name="ID Block",CurrentValue="",PlaceholderText="Item ID of the block to place & break",
-        RemoveTextAfterFocusLost=false,Callback=function(value)
-            if ui.updating then return end
-            if busy() then notify("Stop PNB before changing the Block ID.");ui.Sync(true);return end
-            local text=tostring(value):match("^%s*(.-)%s*$")
-            if text=="" then ui.pnbId=nil;ui.Sync(true);return end
-            local id=tonumber(text)
-            local name,why=pnbBlockInfo(id)
-            if not name then notify(why);ui.Sync(true);return end
-            ui.pnbId=id
-            log(string.format("PNB Block: %s [%d].",name,id))
-            ui.Sync(true);report(true)
-        end})
-    local pnbToggle=pnbTab:CreateToggle({Name="Start PNB",CurrentValue=false,Callback=function(value)
-        if ui.updating or value==pnbActive() then return end
-        if value then
-            if autoLoop or farm then notify("Turn off Start Farm / Auto Farm before using PNB.");ui.Sync(true);return end
-            if not ui.pnbId then notify("Enter a Block ID first.");ui.Sync(true);return end
-            CONFIG.pnbOnly=true
-            runAction("AutoCycle",ui.pnbId)
-            CONFIG.pnbOnly=false
-            if not autoLoop then notify(tostring(result)) end
-        else
-            runAction("Stop")
-        end
-        report(true);ui.Sync(true)
-    end})
-    local pnbInfo=pnbTab:CreateParagraph({Title="PNB Status",Content="Enter a Block ID above."})
-    pnbTab:CreateSection("Options")
-    settingInput("Hits per Block",hitsInput,"1–50",pnbTab)
-    settingInput("Action Delay (seconds)",delayInput,"0.05–5",pnbTab)
-    pnbTab:CreateParagraph({Title="How PNB Works",Content="Runs the same Place & Break stage as Start Farm, on its own: it places the block, breaks it, and collects every drop, over and over. It never plants or harvests, and it stops when the block runs out. At 200 seeds it stores 100 in Display Box 1422, like the farm cycle. The block needs a seed pair (ID+1). Turn Start PNB off, or press H, to stop."})
-    function ui.SyncPNB()
-        local a=autoLoop and autoLoop.pnbOnly and not autoLoop.visit and autoLoop or nil
-        local shown=a and a.block or ui.pnbId
-        local names={PNB="Place & Break",CEK="Checking Inventory",SETOR="Storing Seeds",JEDA="Recovering"}
-        local lines={}
-        if shown then
-            local name=pnbBlockInfo(shown)
-            local count=binding and inventoryNumber(binding,"count",shown)
-            table.insert(lines,clean(name or ("Item #"..shown)).." ["..shown.."]")
-            table.insert(lines,"In backpack: "..(count and tostring(count) or "—"))
-        else
-            table.insert(lines,"Enter a Block ID above.")
-        end
-        if a then
-            table.insert(lines,"PNB: "..(names[a.stage] or "Checking").." • Cycles: "..cycles)
-            table.insert(lines,"Blocks: "..tostring(a.blocks or "—").." • Seeds: "..tostring(a.seeds or "—").." • Storage transfers: "..tostring(a.deposits or 0))
-            table.insert(lines,clean(tostring(ui.activity or "")))
-        else
-            table.insert(lines,"PNB: "..(autoLoop and "Start Farm is running" or "Stopped"))
-            table.insert(lines,clean(tostring(result):sub(1,200)))
-        end
-        paragraph(pnbInfo,"PNB Status",table.concat(lines,"\n"))
-        ui.updating=true
-        local ok,why=pcall(function()
-            local text=ui.pnbId and tostring(ui.pnbId) or ""
-            if pnbInput.CurrentValue~=text then pnbInput:Set(text) end
-            if pnbToggle.CurrentValue~=pnbActive() then pnbToggle:Set(pnbActive()) end
-        end)
-        ui.updating=false
-        if not ok then adapterStatus="PNB tab sync: "..tostring(why):sub(1,160) end
-    end
-    -- END PNB TAB
     settingsTab:CreateSection("PNB Effects")
     local effectMirrors={}
     for _,setting in ipairs({{name="Sound Effects",key="sounds"},{name="Hand Animations",key="hands"},{name="Block Break Effects",key="blocks"}}) do
@@ -16103,14 +15953,7 @@ return RayfieldLibrary
         table.insert(effectMirrors,{widget=widget,key=key})
     end
     settingsTab:CreateSection("Configuration")
-    local globalFile="PNB_FarmConfig.json"
-    local userFile="PNB_FarmConfig_"..(tostring(player.Name):gsub("[^%w_]","_"))..".json"
-    local configFile=globalFile
-    ui.scope="global"
-    if type(isfile)=="function" then -- file akun ada => akun ini memakai config sendiri (global diabaikan)
-        local okF,found=pcall(isfile,userFile)
-        if okF and found then configFile=userFile;ui.scope="user" end
-    end
+    local configFile="PNB_FarmConfig.json"
     local codecOK,codec=pcall(function() return game:GetService("HttpService") end)
     local configInfo=settingsTab:CreateParagraph({Title="Configuration Status",Content=ui.configStatus})
     function ui.SaveConfig(silent)
@@ -16125,7 +15968,6 @@ return RayfieldLibrary
             local ok=pcall(function() writefile(configFile,codec:JSONEncode(data)) end)
             if ok then
                 ui.configStatus="Configuration saved. Auto Load is "..(ui.autoLoad and "enabled." or "disabled.")
-                    .." Start Farm: "..(data.farmOn and "ON" or "OFF").." | Start PNB: "..(data.pnbOn and "ON" or "OFF").."."
                 if not silent then notify("Configuration saved.") end
                 ui.Sync(true);return true
             end
@@ -16134,26 +15976,6 @@ return RayfieldLibrary
         if not silent then notify(ui.configStatus) end
         ui.Sync(true);return false
     end
-    local scopeToggle=settingsTab:CreateToggle({Name="Per-Username Config",CurrentValue=ui.scope=="user",Callback=function(value)
-        if ui.updating or value==(ui.scope=="user") then return end
-        if busy() then notify("Stop the cycle before changing the config mode.");ui.Sync(true);return end
-        if value then
-            configFile=userFile;ui.scope="user"
-            if not ui.SaveConfig(true) then
-                configFile=globalFile;ui.scope="global";ui.Sync(true);return
-            end
-            ui.configStatus="Config khusus akun "..tostring(player.Name).." dibuat. Config global tidak dipakai akun ini."
-            notify("Per-Username Config ON ("..tostring(player.Name)..").")
-        else
-            if type(delfile)~="function" then notify("Executor tidak punya delfile; hapus "..userFile.." manual lalu execute ulang.");ui.Sync(true);return end
-            if not pcall(delfile,userFile) then notify("Gagal menghapus "..userFile..".");ui.Sync(true);return end
-            configFile=globalFile;ui.scope="global"
-            ui.configStatus="Kembali ke config global. Tekan Save Config untuk menimpa global dengan setelan sekarang."
-            notify("Per-Username Config OFF.")
-        end
-        ui.Sync(true)
-    end})
-    rp.save=function() return ui.SaveConfig(true) end
     local autoLoadToggle=settingsTab:CreateToggle({Name="Auto Load",CurrentValue=true,Callback=function(value)
         if ui.updating then return end
         local previous=ui.autoLoad;ui.autoLoad=value
@@ -16161,7 +15983,7 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
-    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, effects, and preferred UI size. Auto Load restores them next time. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
+    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, effects, UI size, and Hide Username preference. Auto Load restores them next time. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
         local b=bind(false)
@@ -16224,6 +16046,7 @@ return RayfieldLibrary
     function ui.Sync(force)
         if not ui.ready or not alive or not force and os.clock()-ui.lastSync<.5 then return end
         ui.lastSync=os.clock()
+        if ui.hideUsername then ui.usernamePrivacy.Refresh() end
         if binding and binding.itemDB~=ui.db then ui.Rebuild();ui.Search() end
         local row=ui.byId[tonumber(idInput.Text)];ui.selected=row
         local text=row and (clean(row.name).." ["..row.id.."]\nSeed: "..clean(row.seedName).." ["..(row.id+1).."]") or "Select an available block above."
@@ -16235,8 +16058,7 @@ return RayfieldLibrary
         if autoLoop then
             activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
-                or autoLoop.paused and ("Waiting for the server. The cycle will resume automatically.\n"..clean(tostring(farmNote or ""):sub(1,160)))
-                or autoLoop.hop and "Moving to a nearby tile to collect leftover blocks or seeds."
+                or autoLoop.paused and "Waiting for the server. The cycle will resume automatically."
                 or farm and farm.stepRejected and "The game returned a supported step. Waiting here without switching sides."
                 or farm and farm.action and "Waiting for action confirmation."
                 or farm and farm.motion and "Moving to the next tile."
@@ -16247,11 +16069,10 @@ return RayfieldLibrary
         end
         if pickupGate and (running or autoLoop and autoLoop.stage=="PNB") then activity=pickupGate.reason end
         if pending and pending.protectCell then activity="Collecting and verifying drops before PNB continues." end
-        ui.activity=activity
         paragraph(summary,"Farm Status",stage..stock.."\n"..activity)
         local status={"GenHub 1.9.2 | Game version "..tostring(read(game,"PlaceVersion") or "—"),
             "World: "..clean(world or "Unavailable")..(x and string.format(" | Position: %.2f, %.2f",x,y) or ""),
-            "Start Farm: "..(autoLoop and not autoLoop.pnbOnly and "On" or "Off").." | Stage: "..stage,
+            "Start Farm: "..(autoLoop and "On" or "Off").." | Stage: "..stage,
             "Target: "..(row and clean(row.name).." ["..row.id.."] | Seed: "..(row.id+1) or "Not selected"),
             "PNB: "..(running and "On" or "Off").." | Completed cycles: "..cycles,
             "Auto Collect: "..(collecting and "On" or "Off")..string.format(" | Radius: %.2f tiles | Filter: %s",collectRange,clean(filterText)),
@@ -16280,56 +16101,19 @@ return RayfieldLibrary
         table.insert(status,"PNB animations: "..(not effects.hands and "Off" or binding and type(binding.pnbAnimation)=="table" and not binding.pnbAnimation.disabled and "Ready" or "Unavailable"))
         table.insert(status,"PNB sounds: "..(not effects.sounds and "Off" or binding and type(binding.pnbSound)=="table" and not binding.pnbSound.disabled and "Ready" or "Unavailable"))
         table.insert(status,"Block break effects: "..(not effects.blocks and "Off" or binding and type(binding.pnbBlockEffects)=="table" and not binding.pnbBlockEffects.disabled and "Ready" or "Unavailable"))
-        table.insert(status,"Random PNB: "..(rp.enabled and "On" or "Off").." | Farm World: "..tostring(rp.farmWorld or "-")
-            .." | Phase: "..rp.phase..(rp.warp and (" | Warp -> "..rp.warp.target) or "")
-            ..(os.time()<(rp.cooldownUntil or 0) and (" | Cooldown "..(rp.cooldownUntil-os.time()).."s") or ""))
         table.insert(status,"Pickup distance is controlled by the server.")
         paragraph(detail,"Full Status",table.concat(status,"\n"))
-        paragraph(configInfo,"Configuration Status",ui.configStatus.."\nMode: "..(ui.scope=="user" and ("Per-Username ("..tostring(player.Name)..")") or "Global").." | File: "..configFile)
+        paragraph(configInfo,"Configuration Status",ui.configStatus)
         syncScaleInfo()
-        if ui.SyncPNB then ui.SyncPNB() end
         ui.updating=true
         if scaleSlider.CurrentValue~=ui.uiScale then scaleSlider:Set(ui.uiScale) end
+        if privacyToggle.CurrentValue~=ui.hideUsername then privacyToggle:Set(ui.hideUsername) end
         if row and dropdown.CurrentOption[1]~=row.label then dropdown:Set({row.label}) end
-        local farmOn=autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)
-        if cycleToggle.CurrentValue~=farmOn then cycleToggle:Set(farmOn) end
-        if farmWorldInput.CurrentValue~=(rp.farmWorld or "") then farmWorldInput:Set(rp.farmWorld or "") end
-        if randomToggle.CurrentValue~=rp.enabled then randomToggle:Set(rp.enabled) end
-        if scopeToggle.CurrentValue~=(ui.scope=="user") then scopeToggle:Set(ui.scope=="user") end
+        if cycleToggle.CurrentValue~=(autoLoop~=nil) then cycleToggle:Set(autoLoop~=nil) end
         if autoLoadToggle.CurrentValue~=ui.autoLoad then autoLoadToggle:Set(ui.autoLoad) end
         for _,item in ipairs(effectMirrors) do if item.widget.CurrentValue~=effects[item.key] then item.widget:Set(effects[item.key]) end end
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
         ui.updating=false
-    end
-    -- Dipanggil setelah script ter-execute ulang di world random (phase=visit).
-    function ui.RunVisit()
-        local b,world
-        for _=1,60 do
-            if not alive then return end
-            b=bind(false)
-            if b then
-                local _,_,w=positionSnapshot(b)
-                local fg=rawget(b.state,"fg")
-                if w and type(fg)=="table" and next(fg)~=nil then world=w;break end
-            end
-            task.wait(.5)
-        end
-        if not world then rp.leaveVisit(nil,"world random tidak terbaca",true);return end
-        task.wait(1.5)
-        if rp.name(world)==rp.name(rp.farmWorld) then
-            rp.phase="farm";runAction("AutoCycle");return -- sudah di world farm
-        end
-        local lockId,lx,ly=rp.findLock(b)
-        if lockId then
-            rp.leaveVisit(nil,string.format("ada lock (item %d) di (%d,%d)",lockId,lx,ly),true);return
-        end
-        CONFIG.pnbOnly=true;runAction("AutoCycle");CONFIG.pnbOnly=false
-        if autoLoop then
-            autoLoop.visit=true;autoLoop.visitStart=os.clock()
-            log("Random PNB: di world "..tostring(world).."; cek blok lalu PNB.")
-        else
-            rp.leaveVisit(nil,"siklus PNB tidak bisa dimulai: "..tostring(result):sub(1,100),true)
-        end
     end
     ui.Rebuild();ui.Search();ui.ready=true
     local initial=ui.byId[tonumber(idInput.Text)] or (ui.byId[4] and ui.byId[4].available and ui.byId[4])
@@ -16348,15 +16132,10 @@ return RayfieldLibrary
                 if valid.autoLoad and ui.Select(valid.targetId) then
                     hitsInput.Text=tostring(valid.hits);delayInput.Text=tostring(valid.delay==.15 and CONFIG.interval or valid.delay)
                     rangeInput.Text=tostring(valid.range);filterInput.Text=valid.collectFilter
-                    if valid.pnbId then ui.pnbId=valid.pnbId end
                     effects.sounds,effects.hands,effects.blocks=valid.soundEffects,valid.handAnimations,valid.blockEffects
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
+                    ui.hideUsername=valid.hideUsername;ui.usernamePrivacy.Set(ui.hideUsername)
                     ui.configStatus="Saved configuration loaded. Ready to start."
-                    rp.enabled,rp.farmWorld,rp.phase=valid.randomPnb,valid.farmWorld,valid.phase
-                    rp.visitFails,rp.cooldownUntil,rp.lastWorld=valid.visitFails,valid.cooldownUntil,valid.lastWorld
-                    if rp.phase=="visit" and not valid.farmOn then rp.phase="farm" end
-                    if valid.farmOn then ui.pendingAutoStart=(rp.phase=="visit" and rp.enabled and rp.farmWorld) and "visit" or "farm";ui.configStatus="Saved configuration loaded. Start Farm resumed."
-                    elseif valid.pnbOn and valid.pnbId then ui.pendingAutoStart="pnb";ui.configStatus="Saved configuration loaded. Start PNB resumed." end
                 else ui.configStatus="Auto Load is disabled. Default settings are in use." end
             else ui.configStatus=why.." Default settings are in use." end
         elseif type(isfile)=="function" then
@@ -16365,30 +16144,9 @@ return RayfieldLibrary
         end
     else ui.configStatus="Configuration loading is unavailable in this executor." end
     library:SetUIScale(ui.uiScale);ui.Sync(true);panel.Visible=false
-    -- FIX: nyalakan kembali toggle yang tersimpan. Siklus mulai dari JEDA dan mencoba ulang sendiri sampai game siap.
-    if ui.pendingAutoStart then
-        local mode=ui.pendingAutoStart;ui.pendingAutoStart=nil
-        task.spawn(function()
-            -- tunggu sampai tidak ada aksi lain; lalu mulai (siklus sendiri mencoba ulang sampai game siap)
-            for _=1,20 do
-                if not alive then return end
-                if not (autoLoop or running or farm or pending) then break end
-                task.wait(.5)
-            end
-            if not alive or autoLoop or running or farm or pending then return end
-            task.wait(.5)
-            if mode=="visit" then ui.RunVisit()
-            elseif mode=="farm" then runAction("AutoCycle")
-            elseif mode=="pnb" and ui.pnbId then
-                CONFIG.pnbOnly=true;runAction("AutoCycle",ui.pnbId);CONFIG.pnbOnly=false
-            end
-            if not autoLoop and not rp.warp then ui.configStatus="Config dimuat, tetapi auto start gagal: "..clean(tostring(result):sub(1,120)) end
-            report(true);ui.Sync(true)
-        end)
-    end
     log(string.format("GenHub ready; %d farmable blocks.",ui.availableCount))
     if type(writefile)=="function" then
-        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 12\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
+        pcall(writefile,"PNBRange_UI.txt",string.format("GenHub 1.9.2\nUI revision: 13\nLogo: "..(ui.logoAsset and "Original GenHub PNG" or "GenHub text fallback").."\nReference items: %d\nFarmable blocks: %d\nTarget: %s\nAuto Load: %s\nUI Scale: %s%%\n%s\n",
             ui.referenceCount,ui.availableCount,ui.selected and (ui.selected.name.." ["..ui.selected.id.."]") or "Not selected",tostring(ui.autoLoad),tostring(ui.uiScale),ui.configStatus))
     end
 end
