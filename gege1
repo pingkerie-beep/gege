@@ -2131,7 +2131,7 @@ end
 local function farmPlan(f,t,x,y)
     local n=f.native
     local ok,route,why
-    if n.glide and (t.kind=="plant" or t.kind=="harvest") then
+    if n.glide and (t.kind=="plant" or t.kind=="harvest" or t.kind=="pnb" or t.kind=="recovery") then
         local sx,sy=math.floor(x),math.floor(y-.001)
         local search=f.pathSearch
         if not search or search.native~=n or search.world~=f.world
@@ -2277,16 +2277,24 @@ local function farmPlatformMove(f,m,dt,x,y)
     local elapsed=math.max(0,os.clock()-(m.lastStep or os.clock()));m.lastStep=os.clock()
     local node=m.route[m.index]
     local function failed(reason,returned)
+        local count=0
+        if returned then
+            local previous=f.returnedStep
+            count=previous and f.target and previous.key==f.target.key and previous.count+1 or 1
+            f.returnedStep={key=f.target and f.target.key,count=count}
+            f.speed=math.max(2.5,(f.speed or CONFIG.speed)*.8)
+        end
+        local retryDelay=returned and math.min(15,1+count*2) or 2
         if node and node.fromKey~=nil and node.toKey~=nil and node.fromKey~=node.toKey then
             local edge=tostring(node.fromKey)..">"..tostring(node.toKey)
-            f.motionEdges[edge]=os.clock()+(returned and 120 or 2)
+            f.motionEdges[edge]=os.clock()+retryDelay
             if node.kind~="walk" and node.kind~="start" then
                 local corridor="air:"..math.floor(node.fromKey/n.width)..">"..node.y..":"..math.floor(node.x/4)
                 local failures=f.motionEdges.failures or {};f.motionEdges.failures=failures
                 local previous=failures[corridor]
                 local count=previous and os.clock()-previous.at<120 and previous.count+1 or 1
                 failures[corridor]={count=count,at=os.clock()}
-                if count>=3 and returned then f.motionEdges[corridor]=os.clock()+120 end
+                if count>=3 and returned then f.motionEdges[corridor]=os.clock()+retryDelay end
             end
             traceMotion("SUPPORT STEP deferred "..edge..": "..reason)
         end
@@ -2297,8 +2305,8 @@ local function farmPlatformMove(f,m,dt,x,y)
             farmNote="The supported step was rejected; the first eligible tile stays selected."
             f.stepRejected=nil
             if returned then
-                f.stepRejected={x=x,y=y,reason=reason}
-                farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
+                f.stepRejected={x=x,y=y,reason=reason,retryAt=os.clock()+retryDelay,count=count}
+                farmNote="The game returned a movement step. Retrying from the current position after a short pause."
             end
         else
             f.target=nil;f.candidates={};f.scan=nil;f.nextScan=0
@@ -2323,7 +2331,17 @@ local function farmPlatformMove(f,m,dt,x,y)
             failed("final support changed during the edge transfer");return
         end
         if os.clock()-(transfer.progressAt or transfer.at)>3 then failed("clear edge transfer made no progress");return end
-        if math.abs(x-transfer.x)>.18 or math.abs(y-transfer.y)>.18 then failed("clear edge transfer was returned",true);return end
+        -- Gravity runs before RenderStepped. At low FPS its real displacement
+        -- exceeds the old fixed .18 tolerance without being a server rollback.
+        -- Only accept a bounded fall consistent with the current native velocity;
+        -- the complete reverse body segment still has to be collision-clear.
+        -- Landing zeroes vy, so include the native gravity tick as well as
+        -- the remaining velocity. The bound stays capped at two tiles.
+        local fallTolerance=math.max(.18,math.min(2,math.max(0,s.vy or 0)*elapsed+55*elapsed*elapsed+.03))
+        if math.abs(x-transfer.x)>.18 or y<transfer.y-.18 or y-transfer.y>fallTolerance then
+            failed(string.format("clear edge transfer was returned (actual %.3f,%.3f; planned %.3f,%.3f; vy %.3f; dt %.3f)",
+                x,y,transfer.x,transfer.y,s.vy or 0,elapsed),true);return
+        end
         if farmBoxHits(n,x,y) then failed("clear edge transfer is obstructed");return end
         -- Publish the position and flags produced by the preceding native tick.
         -- Never publish a newly unsupported waypoint with the old grounded flag.
@@ -2343,7 +2361,7 @@ local function farmPlatformMove(f,m,dt,x,y)
         local dx,dy=point.x-transfer.x,point.y-transfer.y
         local distance=math.sqrt(dx*dx+dy*dy)
         if distance<=.00001 then transfer.index+=1;return end
-        local stride=math.min(distance,CONFIG.speed*math.max(0,math.min(dt,elapsed,CONFIG.frameLimit)))
+        local stride=math.min(distance,math.min(f.speed or CONFIG.speed,CONFIG.speed)*math.max(0,math.min(dt,elapsed,CONFIG.frameLimit)))
         if stride<=0 then return end
         local nx,ny=transfer.x+dx/distance*stride,transfer.y+dy/distance*stride
         if not clearSegment(transfer.x,transfer.y,nx,ny) then failed("edge transfer path changed");return end
@@ -2405,7 +2423,7 @@ local function farmPlatformMove(f,m,dt,x,y)
     m.step=m.step or {best=distance,at=os.clock()}
     if distance<m.step.best-.05 then m.step.best=distance;m.step.at=os.clock() end
     if os.clock()-m.step.at>1.5 then failed("supported move made no progress");return end
-    local stride=math.min(distance,CONFIG.speed*math.max(0,math.min(dt,elapsed,CONFIG.frameLimit)))
+    local stride=math.min(distance,math.min(f.speed or CONFIG.speed,CONFIG.speed)*math.max(0,math.min(dt,elapsed,CONFIG.frameLimit)))
     if stride<=0 then return end
     local nx=x+(dx<0 and -stride or stride)
     for i=1,5 do
@@ -2548,6 +2566,7 @@ local function farmTick()
             log(string.format("FARM %s dikonfirmasi server (%d,%d), Seed ID %d, backpack %d -> %d, %.2fs. %s",
                 a.kind,a.x,a.y,f.seed,a.before,count,os.clock()-a.at,note))
             if f.motionFailures then f.motionFailures[a.y*n.width+a.x]=nil end
+            f.returnedStep=nil;f.recoveryTarget=nil
             f.orderCursor=a.y*n.width+a.x
             f.blockedOrder=nil;f.routeRetryAt=nil
             f.job,f.action,f.target=nil,nil,nil;f.scan=nil;f.nextScan=os.clock()
@@ -2571,17 +2590,38 @@ local function farmTick()
         local synced,note=syncInventory(n.b,c.job.reply)
         if not synced then halt("Inventory setelah perpindahan belum sesuai: "..tostring(note));return end
         f.correction=nil;f.motion,f.target,f.scan=nil,nil,nil;f.pathSearch=nil;f.candidates={};f.nextScan=0
+        f.stepRejected=nil;f.recoveryTarget=nil
         if autoLoop then autoLoop.nextCheck=0 end
         f.respawn=rawget(n.b.state,"respawnedAt")
         log("Farm lanjut dari posisi server; memindai ulang pohon SIAP dan tumbuh.");report(true);return
     end
     if (lease.outstanding or 0)>0 or os.clock()<(f.resumeAt or 0) then return end
+    if f.recoveryTarget and not f.target then
+        f.target=f.recoveryTarget;f.recoveryTarget=nil;f.pathSearch=nil
+    end
     if f.stepRejected then
-        if math.abs(x-f.stepRejected.x)<=.5 and math.abs(y-f.stepRejected.y)<=.5 then
-            farmNote="The game returned this supported step. Farming is waiting here; it will not switch sides."
+        local rejected=f.stepRejected
+        if math.abs(x-rejected.x)<=.5 and math.abs(y-rejected.y)<=.5 and os.clock()<(rejected.retryAt or 0) then
+            farmNote="Movement recovery is cooling down before retrying the same farm tile."
             return
         end
         f.stepRejected=nil;f.routeRetryAt=nil;f.pathSearch=nil
+        -- Repeated returns at one stance get a short supported side step, like
+        -- a manual nudge. Keep the original farm tile and its row order intact.
+        if rejected.count and rejected.count>=2 and f.target and not f.recoveryTarget then
+            for _,offset in ipairs({-1,1}) do
+                local t={x=math.floor(x)+offset,y=math.floor(y-.001),key=-1,kind="recovery"}
+                if farmStanding(n,t.x+.5,t.y+.999)
+                    and farmClearFlightSegment(n,x,y,t.x+.5,t.y+.999) then
+                    local route=farmPlan(f,t,x,y)
+                    if route then
+                        f.recoveryTarget=f.target;f.target,f.motion=t,route
+                        farmNote="Moving one supported tile to recover the route.";return
+                    end
+                    f.pathSearch=nil
+                end
+            end
+        end
     end
     if n.glide and not farmStanding(n,x,y) then
         farmVelocity(n,0)
@@ -2589,6 +2629,11 @@ local function farmTick()
         return
     end
     if f.target then
+        if f.target.kind=="recovery" then
+            f.target=f.recoveryTarget;f.recoveryTarget=nil;f.pathSearch=nil
+            f.blockedOrder=nil;f.routeRetryAt=nil;f.arrived=0
+            farmNote="Resuming the original farm tile after repositioning.";return
+        end
         if f.routeRetryAt and os.clock()<f.routeRetryAt then
             farmNote=string.format("Waiting to reach the first eligible tile (%d,%d); later tiles stay queued.",f.target.x,f.target.y)
             return
@@ -2663,6 +2708,7 @@ local function farmServerMoved()
     table.insert(recent,os.clock());f.corrections=recent
     if #recent>=3 then halt("Server mengubah posisi berulang kali; farm dihentikan.");report(true);return end
     f.motion,f.target,f.scan=nil,nil,nil;f.pathSearch=nil;f.candidates={}
+    f.stepRejected=nil;f.recoveryTarget=nil
     f.speed=math.max(4,(f.speed or CONFIG.speed)*.65)
     if autoLoop then
         running=false;cycle,anchor,settings=nil,nil,nil;runButton.Text="PNB: OFF"
@@ -2810,7 +2856,10 @@ local function updatePNB(b)
             if not ok then halt("Pemeriksaan petak native gagal.");return end
             if allowed~=true then
                 settings.blockedAt=settings.blockedAt or os.clock()
-                if os.clock()-settings.blockedAt>=CONFIG.rpcTimeout then halt("Petak PNB belum siap setelah verifikasi native.") end
+                if os.clock()-settings.blockedAt>=CONFIG.rpcTimeout then
+                    if autoLoop then autoLoop.relocateHome=true end
+                    halt("The PNB tile stayed unavailable. Selecting another permitted tile.")
+                end
                 return
             end
             settings.blockedAt=nil
@@ -2829,7 +2878,10 @@ local function updatePNB(b)
                 autoLoop.progressAt=os.clock()
                 if inventoryNumber(b,"count",autoLoop.block)==0 then autoLoop.nextCheck=0 end
             end
-        elseif b.netCall and cycle.hits>=50 then halt("Blok belum pecah setelah 50 hit native.");return end
+        elseif b.netCall and cycle.hits>=50 then
+            if autoLoop then autoLoop.relocateHome=true end
+            halt("The block did not break after confirmed native hits. Checking another PNB tile.");return
+        end
     end
     nextAction=os.clock()+(b.netCall and settings.interval or cycle and settings.interval or math.max(.3,settings.interval))
 end
@@ -2920,6 +2972,7 @@ local function loopStage(a,stage)
     a.progressAt=os.clock()
     farm.motion,farm.target,farm.scan=nil,nil,nil;farm.pathSearch=nil;farm.candidates={};farm.nextScan=0
     farm.blockedOrder=nil;farm.routeRetryAt=nil;farm.pathSearch=nil;farm.stepRejected=nil
+    farm.recoveryTarget=nil;farm.returnedStep=nil
     farm.lastScan=nil
     if stage=="TANAM" then farm.mode="plant"
     elseif stage=="PANEN" or stage=="TUNGGU" then farm.mode="harvest" end
@@ -3042,7 +3095,8 @@ local function localPNBHome(a,x,y,emptyOnly)
     if not drops then return nil end
     for _,cell in ipairs(candidates) do
         local tx,ty=cell.tx,cell.ty
-        if tx>=0 and tx<n.width and ty>=0 and ty<n.height then
+        if tx>=0 and tx<n.width and ty>=0 and ty<n.height
+            and (not a.badPNBTargets or (a.badPNBTargets[ty*n.width+tx] or 0)<=os.clock()) then
             local current=farmTile(n,tx,ty,a.layer)
             if current==0 or not emptyOnly and current==a.block then
                 local permitted,mayBuild=pcall(a.display.mayBuild,rawget(n.b.state,"lock"),tx,ty)
@@ -3071,46 +3125,77 @@ local function localPNBHome(a,x,y,emptyOnly)
     return nil
 end
 local function replacePNBHome(a,x,y)
-    local n,found=a.native,{}
-    local drops=records(n.b)
-    if not drops then halt("Data drop belum tersedia untuk memilih petak PNB baru.");return false end
-    local occupied={}
-    for _,record in next,drops do
-        if worldDrop(n.b,record) then occupied[math.floor(record.y)*n.width+math.floor(record.x)]=true end
+    local n=a.native
+    if a.relocateHome then
+        a.badPNBTargets=a.badPNBTargets or {}
+        if a.home then a.badPNBTargets[a.home.ty*n.width+a.home.tx]=os.clock()+30 end
+        a.relocateHome=nil;a.homeSearch=nil;farm.pathSearch=nil
     end
-    local localHome=localPNBHome(a,x,y,true)
-    if localHome then
-        a.home=localHome;farm.target,farm.motion=nil,nil
-        a.prepare=true;a.prep=nil
-        log(string.format("PNB target selected %s (%d,%d); character stays on its supported tile.",a.layer,localHome.tx,localHome.ty))
-        return true
+    local search=a.homeSearch
+    if search and (search.native~=n or math.abs(search.x-x)>.35 or math.abs(search.y-y)>.35) then
+        a.homeSearch=nil;farm.pathSearch=nil;search=nil
     end
-    for sy=1,n.height-2 do
-        for sx=0,n.width-1 do
-            if farmTile(n,sx,sy-1,a.layer)==0 and not n.solid(sx,sy) and not occupied[(sy-1)*n.width+sx]
-                and (not a.badHomes or (a.badHomes[sy*n.width+sx] or 0)<=os.clock()) then
+    if not search then
+        local drops=records(n.b)
+        if not drops then halt("Data drop belum tersedia untuk memilih petak PNB baru.");return false end
+        local occupied={}
+        for _,record in next,drops do
+            if worldDrop(n.b,record) then occupied[math.floor(record.y)*n.width+math.floor(record.x)]=true end
+        end
+        local localHome=localPNBHome(a,x,y,true)
+        if localHome then
+            a.home=localHome;farm.target,farm.motion=nil,nil
+            a.prepare=true;a.prep=nil
+            log(string.format("PNB target selected %s (%d,%d); character stays on its supported tile.",a.layer,localHome.tx,localHome.ty))
+            return true
+        end
+        search={native=n,x=x,y=y,homes={},index=1,scanIndex=0,occupied=occupied};a.homeSearch=search
+    end
+    if search.scanIndex then
+        local started,visited=os.clock(),0
+        while search.scanIndex<n.width*(n.height-2) do
+            local sx,sy=search.scanIndex%n.width,1+math.floor(search.scanIndex/n.width)
+            search.scanIndex+=1;visited+=1
+            if farmTile(n,sx,sy-1,a.layer)==0 and not n.solid(sx,sy) and not search.occupied[(sy-1)*n.width+sx]
+                and (not a.badHomes or (a.badHomes[sy*n.width+sx] or 0)<=os.clock())
+                and (not a.badPNBTargets or (a.badPNBTargets[(sy-1)*n.width+sx] or 0)<=os.clock()) then
                 local below=farmTile(n,sx,sy+1)
                 local support=below and rawget(n.b.itemDB,below)
                 if type(support)=="table" and (rawget(support,"solid")==true or rawget(support,"platform")==true) then
                     local ok,allowed=pcall(a.display.mayBuild,rawget(n.b.state,"lock"),sx,sy-1)
                     if ok and allowed==true then
-                        table.insert(found,{x=sx+.5,y=sy+.999,sx=sx,sy=sy,tx=sx,ty=sy-1,d=(sx+.5-x)^2+(sy+.999-y)^2})
-                        table.sort(found,function(l,r) return l.d<r.d end)
-                        if #found>32 then table.remove(found) end
+                        table.insert(search.homes,{x=sx+.5,y=sy+.999,sx=sx,sy=sy,tx=sx,ty=sy-1,d=(sx+.5-x)^2+(sy+.999-y)^2})
+                        table.sort(search.homes,function(l,r) return l.d<r.d end)
+                        if #search.homes>32 then table.remove(search.homes) end
                     end
                 end
             end
+            if visited>=256 or os.clock()-started>=.003 then
+                farmNote="Scanning permitted PNB positions in small batches.";return false
+            end
         end
+        search.scanIndex=nil;search.occupied=nil
     end
-    for _,home in ipairs(found) do
+    -- Keep a cooperative search on its current candidate. Trying the next
+    -- candidate while it is still planning discarded all CPU work on slow devices.
+    for _=1,2 do
+        local home=search.homes[search.index]
+        if not home then break end
         local t={x=home.sx,y=home.sy,key=0,kind="pnb"}
-        local route=farmPlan(farm,t,x,y)
+        local route,why=farmPlan(farm,t,x,y)
         if route then
-            a.home=home;farm.target,farm.motion=t,route
+            a.homeSearch=nil;a.home=home;farm.target,farm.motion=t,route
+            a.prepare=true;a.prep=nil;a.progressAt=os.clock()
             log(string.format("Memindahkan PNB ke petak kosong tanpa drop %s (%d,%d).",a.layer,home.tx,home.ty))
             return true
         end
+        if why=="planning" then
+            farmNote="Planning a route away from the blocked PNB tile.";return false
+        end
+        search.index+=1
     end
+    if search.homes[search.index] then farmNote="Checking the next permitted PNB position.";return false end
+    a.homeSearch=nil
     halt("Tidak ditemukan petak PNB kosong yang diizinkan dan dapat dijangkau.");return false
 end
 local function startupBreak(a,x,y)
@@ -3135,6 +3220,7 @@ local function startupBreak(a,x,y)
         halt("Blok awal di luar jangkauan/izin pukul native.");return
     end
     if os.clock()-p.at>12 or p.hits>=50 then
+        a.relocateHome=true
         halt("Break awal belum selesai setelah hit native; lihat log BREAK AWAL. Tidak mengulang tanpa batas.");return
     end
     if os.clock()<p.nextAt then return end
@@ -3151,7 +3237,7 @@ local function loopTick()
     local x,y,world=livePosition(a.native.b)
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
     if a.deposit then depositTick(a,x,y);return end
-    if a.blockedHome then
+    if a.homeSearch or a.blockedHome then
         if replacePNBHome(a,x,y) then
             a.blockedHome=nil;pickupGate=nil
             farmNote="PNB dipindahkan agar stok blok berkurang; kolek tetap berjalan saat ruang tersedia."
@@ -3196,8 +3282,11 @@ local function loopTick()
             if h.world~=world then a.heldPNB=nil
             elseif math.abs(x-h.anchor.x)>.18 or math.abs(y-h.anchor.y)>.18 then
                 local stand={x=math.floor(h.anchor.x),y=math.floor(h.anchor.y-.001),key=0,kind="pnb"}
-                local route=farmPlan(f,stand,x,y)
-                if not route then halt("Tidak ada rute kembali ke blok PNB yang menunggu kolek.");return end
+                local route,why=farmPlan(f,stand,x,y)
+                if not route then
+                    if why~="planning" then halt("Tidak ada rute kembali ke blok PNB yang menunggu kolek.") end
+                    return
+                end
                 f.target,f.motion=stand,route;return
             else
                 a.heldPNB=nil;f.target,f.motion=nil,nil
@@ -3220,7 +3309,8 @@ local function loopTick()
             end
             loopStage(a,"TANAM");return
         end
-        if os.clock()-(a.progressAt or os.clock())>15 then
+        if os.clock()-(a.progressAt or os.clock())>15 and not f.pathSearch then
+            a.relocateHome=true
             halt("PNB belum menghasilkan perubahan inventory/pickup server selama 15 detik; periksa petak/pukulan pada log.");return
         end
         if running then return end
@@ -3268,8 +3358,11 @@ local function loopTick()
         if allowed~=true then
             local stand={x=t.sx or math.floor(t.x),y=t.sy or math.floor(t.y-.001),key=0,kind="pnb"}
             if math.abs(x-t.x)<.1 and math.abs(y-t.y)<.1 then halt("Petak PNB ditolak canPlace/izin native.");return end
-            local m=farmPlan(f,stand,x,y)
-            if not m then halt("Tidak ada rute kembali ke petak PNB awal.");return end
+            local m,why=farmPlan(f,stand,x,y)
+            if not m then
+                if why~="planning" then a.relocateHome=true;halt("Tidak ada rute kembali ke petak PNB awal.") end
+                return
+            end
             f.target,f.motion=stand,m;return
         end
         f.target=nil
@@ -3317,13 +3410,21 @@ recoverLoop=function()
     local a=autoLoop;local p=a and a.paused
     if not p or os.clock()<p.retryAt then return end
     if a.rejoin then return end
-    if (lease.outstanding or 0)>0 then farmNote="JEDA: menunggu permintaan server lama selesai; siklus tetap ON.";return end
+    if (lease.outstanding or 0)>0 then
+        p.status="Waiting for the previous server request to finish. No duplicate requests are sent."
+        farmNote=p.status;return
+    end
+    p.status="Rechecking the character, inventory, and farm position."
     if not p.session then
         p.retryAt=os.clock()+2
         local b,x,y,world=canStart()
-        if not b then farmNote="JEDA: "..tostring(x).."; akan diperiksa ulang.";return end
+        if not b then
+            p.status="Waiting for a live character and a valid game connection. Checking again automatically."
+            farmNote=p.status;return
+        end
         if a.pinnedWorld and world~=a.pinnedWorld then
-            farmNote="Waiting for farm world "..a.pinnedWorld..". Farming will not run in another world.";return
+            p.status="Waiting for farm world "..a.pinnedWorld..". Farming resumes in that world."
+            farmNote=p.status;return
         end
         if a.deposit and a.deposit.phase~="before" and world~=(a.deposit.world or a.world) then
             farmNote="JEDA: verifikasi setor menunggu world "..tostring(a.deposit.world or a.world).."; tidak mengirim setor ulang.";return
@@ -3343,11 +3444,11 @@ recoverLoop=function()
         if not p.job then
             p.inventoryReady=nil
             local remote=rpcFor(b,"GetInventory")
-            if not remote then farmNote="Waiting for server inventory access.";return end
-            farmNote="Reading backpack inventory before starting farm actions."
+            if not remote then p.status="Waiting for server inventory access.";farmNote=p.status;return end
+            p.status="Reading backpack inventory before resuming farm actions.";farmNote=p.status
             request(p,remote);p.retryAt=0;return
         end
-        if not p.job.done then farmNote="Waiting for the server inventory snapshot.";return end
+        if not p.job.done then p.status="Waiting for the server inventory snapshot.";farmNote=p.status;return end
         if not p.inventoryReady then
             local valid=loopInventory(a,p.job.reply,p,b)
             if not valid then
@@ -3358,7 +3459,7 @@ recoverLoop=function()
         end
         p.retryAt=os.clock()+2
         local display,why=displayBinding(b)
-        if not display then farmNote="JEDA: "..why;return end
+        if not display then p.status="Waiting for the game's building and storage permissions.";farmNote=p.status;return end
         if a.deposit and a.deposit.phase~="before" and not display.remote then farmNote="JEDA: "..display.reason;return end
         local tx,ty=math.floor(x),math.floor(y-.475)-1
         if tx<0 or tx>=b.state.w then farmNote="Waiting for a supported position inside the world.";return end
@@ -3368,23 +3469,24 @@ recoverLoop=function()
         loopButton.Text="Siklus otomatis: ON"
         if not farm or not farm.native.buildRange then
             p.job=nil;p.inventoryReady=nil
-            farmNote="JEDA: pengikatan gerak/plant/hit belum tersedia; akan diperiksa ulang.";return
+            p.status="Waiting for the game's movement, plant, and break functions. Retrying automatically."
+            farmNote=p.status;return
         end
         local ready,s=pcall(farm.native.getState)
         if not ready or type(s)~="table" or s.active~=true or s.dead~=false then
             stopFarm();p.job=nil;p.inventoryReady=nil
-            farmNote="JEDA: menunggu karakter aktif/hidup; siklus tetap ON.";return
+            p.status="Waiting for the character to become active. Start Farm remains on.";farmNote=p.status;return
         end
         a.native,a.display=farm.native,display
         if a.world~=world then a.capacityDrops=nil;a.blockedHome=nil end
         if not a.home or a.world~=world then a.home={x=x,y=y,tx=tx,ty=ty} end
         a.world=world;a.pinnedWorld=a.pinnedWorld or world;a.layer=rawget(def,"background")==true and "bg" or "fg"
         layer=a.layer;layerButton.Text="Layer: "..layer:upper()
-        a.prep=nil;a.prepare=true;a.job=nil
+        a.prep=nil;a.prepare=true;a.job=nil;a.homeSearch=nil
         watchDisplay(a,farm);p.session=true;p.retryAt=0
     end
     if not p.job then request(p,rpcFor(a.native.b,"GetInventory"));return end
-    if not p.job.done then farmNote="JEDA: menunggu snapshot inventory server; siklus tetap ON.";return end
+    if not p.job.done then p.status="Waiting for the server inventory snapshot.";farmNote=p.status;return end
     local inventoryReady=p.inventoryReady or loopInventory(a,p.job.reply,p)
     p.inventoryReady=nil
     if not inventoryReady then
@@ -3419,6 +3521,7 @@ recoverLoop=function()
     collecting=true;collectFilter,filterText=nil,"ALL";filterInput.Text="ALL"
     runButton.Text="PNB: OFF";collectButton.Text="Kolek: ON";farmButton.Text="Auto Farm: ON"
     loopStage(a,resume)
+    if resume=="PNB" and a.relocateHome then a.blockedHome=true end
     log("SIKLUS lanjut otomatis; inventory server sudah dibaca, tahap "..resume..".");report(true)
 end
 -- Keep world-menu recovery separate from planting and inventory transactions.
@@ -16266,8 +16369,9 @@ return RayfieldLibrary
         if autoLoop then
             activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
-                or autoLoop.paused and "Waiting for the server. The cycle will resume automatically."
-                or farm and farm.stepRejected and "The game returned a supported step. Waiting here without switching sides."
+                or autoLoop.paused and (autoLoop.paused.status or "Rechecking the character, inventory, and farm position.")
+                or farm and farm.stepRejected and "Movement was returned by the game. Retrying the route automatically after a short pause."
+                or farm and farm.recoveryTarget and "Repositioning on a nearby supported tile, then resuming the original target."
                 or farm and farm.action and "Waiting for action confirmation."
                 or farm and farm.motion and "Moving to the next tile."
                 or farm and farm.pathSearch and string.format("Planning the route to the first eligible tile (%d,%d).",farm.pathSearch.gx,farm.pathSearch.gy)
