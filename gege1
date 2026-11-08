@@ -133,6 +133,12 @@ local function debugPosition()
     if not world or not finite(x) or not finite(y) then return nil end
     return x,y,world,tonumber(text:match("hp%s+([%d%.]+)"))
 end
+local function othersFrom(ev) -- PATCH 1179: indeks upvalue enter bergeser (5 -> 6)
+    for _,v in pairs(ev or {}) do
+        if type(v)=="table" and type(rawget(v,"update"))=="function" and type(rawget(v,"sendHit"))=="function" then return v end
+    end
+    return nil
+end
 local function gameRenderer(fn,controller)
     return ownedArity(fn,controller,1) and hasConstants(fn,{"punchFresh","punchPressed","GetServerTimeNow"})
 end
@@ -140,7 +146,7 @@ local function nativeStateSnapshot(b)
     if not b then return nil end
     if not b.stateGetter then
         local ev=upvalues(rawget(b.state,"enter"))
-        local others=ev and ev[5]
+        local others=othersFrom(ev)
         local update=type(others)=="table" and rawget(others,"update")
         local module=b.gameGui and b.gameGui:FindFirstChild("Others")
         local uv=module and ownedArity(update,module,4) and upvalues(update)
@@ -167,9 +173,8 @@ local function nativePosition(b)
     if type(world)~="string" or world=="" or not integer(w) or not integer(h) or w<=0 or h<=0
         or type(rawget(b.state,"fg"))~="table" or not finite(x) or not finite(y)
         or (b.stateGetter and (not s or math.abs(s.x-x)>.01 or math.abs(s.y-y)>.01))
-        or (not b.stateGetter and not finite(hp))
         or x<0 or x>w or y< -4 or y>h then return nil end
-    return x,y,world,not b.stateGetter and hp or nil
+    return x,y,world,nil -- PATCH 1179: upvalue 37 bukan hp lagi
 end
 local function positionSnapshot(b)
     local x,y,world,hp=debugPosition()
@@ -226,6 +231,28 @@ local function bind(force)
             end
         end
     end
+    if #candidates==0 then -- PATCH 1179: nama remote MoveTo diacak; ambil state dari renderer
+        local okR,rlist=pcall(getconnections,RunService.RenderStepped)
+        if okR and type(rlist)=="table" then
+            for index,connection in ipairs(rlist) do
+                if index>64 then break end
+                local rfn=read(connection,"Function")
+                if read(connection,"Enabled")~=false and gameRenderer(rfn,controller) then
+                    local rv=upvalues(rfn)
+                    local st=rv and rv[1]
+                    local goTo=type(st)=="table" and rawget(st,"goTo")
+                    local gvv=type(goTo)=="function" and upvalues(goTo)
+                    if gvv and not seen[goTo] and ownedArity(goTo,controller,2)
+                        and hasConstants(goTo,{"Vector2","new","deadAt","0.5","1"})
+                        and finite(gvv[1]) and finite(gvv[2])
+                        and (not x or math.abs(gvv[1]-x)<=.25 and math.abs(gvv[2]-y)<=.25) then
+                        seen[goTo]=true
+                        table.insert(candidates,{positionFn=goTo,state=st,controller=controller,camera=camera,gameGui=gameGui})
+                    end
+                end
+            end
+        end
+    end
     if #candidates~=1 then adapterStatus="Binding posisi tidak cocok: "..#candidates.." kandidat.";return nil end
     local b=candidates[1]
     if not x then
@@ -264,6 +291,16 @@ local function bind(force)
             if type(value)=="table" and takenTables[value] and not seenLists[value] then
                 seenLists[value]=true;table.insert(lists,{fn=callback.fn,index=index})
             end
+        end
+    end
+    if #lists~=1 then -- PATCH 1179: ambil tabel drop langsung dari state.dropList / state.dropTaken
+        local dl=rawget(b.state,"dropList")
+        local dv=type(dl)=="function" and ownedArity(dl,controller,0) and upvalues(dl)
+        if dv and type(dv[1])=="table" then
+            lists={{fn=dl,index=1}}
+            local dt=rawget(b.state,"dropTaken")
+            local dtu=type(dt)=="function" and upvalues(dt)
+            if dtu and dtu[1]==dv[1] then takenCallbacks={{fn=dt,up=dtu}} end
         end
     end
     if #lists~=1 then adapterStatus="Tabel drop aktif belum cocok: "..#lists.." kandidat.";return nil end
@@ -336,13 +373,19 @@ local function bind(force)
     for value in pairs(huds) do hud=value;hudCount+=1 end
     if hudCount==1 then b.setGems=rawget(hud,"setGems") end
     local enter=rawget(b.state,"enter")
-    if ownedArity(enter,controller,2) and hasConstants(enter,{"EnterWorld","InvokeServer","goTo"}) then
+    if ownedArity(enter,controller,2) and hasConstants(enter,{"InvokeServer","goTo"}) then
         local values=upvalues(enter)
         local solid=values and values[4]
         if ownedArity(solid,controller,2) and hasConstants(solid,{"w","h","fg","solid"}) then
             local source=upvalues(solid)
             if source and source[1]==b.state and type(source[2])=="table" then b.itemDB=source[2] end
         end
+    end
+    if not b.itemDB then -- PATCH 1179: ItemDB juga ada di upvalue 6 state.dropOk
+        local okf=rawget(b.state,"dropOk")
+        local ov=type(okf)=="function" and upvalues(okf)
+        local cand=ov and ov[6]
+        if type(cand)=="table" and type(rawget(cand,1))=="table" and rawget(rawget(cand,1),"name")~=nil then b.itemDB=cand end
     end
     local shared=RS:FindFirstChild("Shared")
     local module=shared and shared:FindFirstChild("Inventory")
@@ -1436,14 +1479,80 @@ local function farmBinding(b)
             treeHandler,trees=callback.fn,callback.up[2]
         end
     end
-    if not trees then return nil,"Tabel tanaman aktif belum cocok." end
+    -- PATCH 1179 v3: tabel tanaman TIDAK wajib untuk PNB. Dicari lazy; kalau belum ada pakai placeholder kosong.
+    local function locateTrees(quiet)
+        local function note(m) if not quiet then save(m) end end
+        local found,order={},{}
+        local function collect(label,fn)
+            for index,value in pairs(upvalues(fn) or {}) do
+                if type(value)=="table" and value~=b.state and value~=b.itemDB and value~=b.inventory then
+                    if not found[value] then found[value]={};table.insert(order,value) end
+                    table.insert(found[value],label.."#"..tostring(index))
+                end
+            end
+        end
+        collect("hit",hit);collect("plant",plant);collect("canPlace",canPlace);collect("ripe",ripe)
+        for _,key in ipairs({"treeLook","treeFruit","treeNear","tileChanged","remoteHit"}) do collect(key,rawget(b.state,key)) end
+        local function treeShaped(t) -- >=1 record berbentuk {p=angka}; ItemDB/tabel lain ditolak
+            local n=0
+            for _,record in next,t do
+                if type(record)~="table" or type(rawget(record,"p"))~="number" then return false end
+                n+=1
+                if n>=5 then break end
+            end
+            return n>0
+        end
+        local function sample(t)
+            local parts,n={},0
+            for key,record in next,t do
+                n+=1
+                local desc=typeof(record)
+                if type(record)=="table" then
+                    local fields,count={},0
+                    for field,value in next,record do
+                        count+=1
+                        if count<=8 then table.insert(fields,tostring(field).."="..typeof(value)) end
+                    end
+                    desc="table{"..table.concat(fields,",").."}"
+                end
+                table.insert(parts,tostring(key).."->"..desc)
+                if n>=2 then break end
+            end
+            return #parts>0 and table.concat(parts," ; ") or "(kosong)"
+        end
+        local pick
+        for _,t in ipairs(order) do
+            local shaped=treeShaped(t)
+            if not quiet then note("tree candidate via "..table.concat(found[t],",").." shaped="..tostring(shaped).." sample: "..sample(t)) end
+            if shaped then
+                if pick and pick~=t then pick=false;break end
+                pick=t
+            end
+        end
+        if pick==nil then -- world tanpa pohon: pakai tabel yang dikenali di world sebelumnya
+            local cached=env["_GenHubTrees_1179"]
+            if type(cached)=="table" and found[cached] then pick=cached;note("tree table dari cache world sebelumnya.") end
+        end
+        if pick then env["_GenHubTrees_1179"]=pick;return pick end
+        return nil
+    end
+    local treesMissing=false
+    if not trees then
+        trees=locateTrees(false)
+        if trees then treeHandler=rawget(b.state,"treeLook")
+        else
+            trees={};treesMissing=true
+            save("Tabel tanaman belum ada: PNB tetap jalan; tanam menunggu pohon pertama muncul.")
+        end
+    end
     local gameGui=controller.Parent
     local module=gameGui:FindFirstChild("Others")
     local enter=rawget(b.state,"enter")
     local ev=ownedArity(enter,controller,2) and upvalues(enter)
-    local others=ev and ev[5]
+    local others=othersFrom(ev)
     local update=type(others)=="table" and rawget(others,"update")
     local sendHit=type(others)=="table" and rawget(others,"sendHit")
+    save("others="..typeof(others).." update="..functionDescription(update).." sendHit="..functionDescription(sendHit))
     if not module or not ownedArity(update,module,4) or not ownedArity(sendHit,module,2)
         or not hasConstants(update,{"seen","group","nameBox"}) or not hasConstants(sendHit,{"act","send","kind"}) then
         return nil,"Others untuk gerak farm belum cocok."
@@ -1453,6 +1562,11 @@ local function farmBinding(b)
         return nil,"Sender gerak native belum cocok."
     end
     local sv,hitv=upvalues(sender),upvalues(sendHit)
+    do
+        local parts={}
+        for index,value in pairs(sv or {}) do table.insert(parts,tostring(index).."="..typeof(value)) end
+        save("sender upvalues: "..table.concat(parts,", "))
+    end
     local config,net=sv and sv[1],sv and sv[5]
     if type(config)~="table" or type(net)~="table" or not hitv or hitv[1]~=net then return nil,"Identitas Net gerak berbeda." end
     local getter,solid=rawget(config,"state"),rawget(config,"solidAt")
@@ -1487,7 +1601,7 @@ local function farmBinding(b)
         and gv[3]==rendered[20] and gv[4]==rendered[21]
     save("Movement="..(glide and "supported steps; native arrival caches; no jump impulse" or "legacy goTo fallback"))
     save("Avatar collision="..(boxHits and "native boxHits" or "native-sized bounds"))
-    return {b=b,canPlace=canPlace,plant=plant,hit=hit,setTile=setTile,ripe=ripe,trees=trees,getState=getter,solid=solid,send=send,
+    return {b=b,canPlace=canPlace,plant=plant,hit=hit,setTile=setTile,ripe=ripe,trees=trees,treesMissing=treesMissing,locateTrees=locateTrees,getState=getter,solid=solid,send=send,
         rangeFn=rangeFn,buildRange=buildRange,width=width,height=height,boxHits=boxHits,glide=glide,render=renderer}
 end
 local function farmBoxHits(n,x,y)
@@ -1913,6 +2027,12 @@ local function farmClock()
     local ok,now=pcall(function() return game:GetService("Workspace"):GetServerTimeNow() end)
     return ok and type(now)=="number" and now==now and math.abs(now)<1e13 and now or nil
 end
+local function refreshTrees(n) -- PATCH 1179 v3: cari tabel tanaman lagi kalau tadinya belum ada
+    if n and n.treesMissing and n.locateTrees then
+        local ok,t=pcall(n.locateTrees,true)
+        if ok and t then n.trees=t;n.treesMissing=false;traceMotion("Tabel tanaman ditemukan.") end
+    end
+end
 local function farmTreeState(f,x,y)
     local n=f.native
     local tree=rawget(n.trees,y*n.width+x)
@@ -1945,6 +2065,15 @@ local function farmEligible(f,x,y)
         end
         if f.mode~="plant" and data.status=="ready" then return "harvest",data end
         return nil,data
+    elseif id==0 and f.mode~="harvest" and rawget(n.trees,key)~=nil then
+        -- PATCH 1179 diagnosa: petak kosong tapi dianggap ada tanaman oleh tabel n.trees
+        if (f.treeSkipLogged or 0)<12 then
+            f.treeSkipLogged=(f.treeSkipLogged or 0)+1
+            local rec=rawget(n.trees,key)
+            local fields={}
+            if type(rec)=="table" then for field,value in next,rec do if #fields<8 then table.insert(fields,tostring(field).."="..typeof(value)) end end end
+            traceMotion(string.format("SKIP tile kosong (%d,%d): n.trees[%d] terisi (%s){%s}",x,y,key,typeof(rec),table.concat(fields,",")))
+        end
     elseif id==0 and f.mode~="harvest" and (inventoryNumber(n.b,"count",f.seed) or 0)>0
         and rawget(n.trees,key)==nil then
         local below=farmTile(n,x,y+1)
@@ -1957,6 +2086,7 @@ local function farmScanStep(f)
     if f.orderMode~=f.mode then
         f.orderMode=f.mode;f.orderCursor=nil;f.scan=nil;f.candidates={}
     end
+    refreshTrees(f.native)
     local s=f.scan
     if not s then s={index=0,candidates={},empty=0,ripe=0,growing=0,unknown=0,rows={}};f.scan=s end
     local n=f.native
@@ -2416,6 +2546,7 @@ local function farmTick()
             local confirmed=a.ack
             if not confirmed and n.b.netCall and a.kind=="plant" and count==a.before-1 then
                 -- Native plant updates the tile locally. The tree record is populated separately by the game.
+                refreshTrees(n)
                 local record=rawget(n.trees,a.y*n.width+a.x)
                 confirmed=type(record)=="table" and type(rawget(record,"p"))=="number"
                     and farmTile(n,a.x,a.y)==f.seed
@@ -2497,6 +2628,13 @@ local function farmTick()
             local good,allowed=pcall(n.canPlace,n.b.itemDB[f.seed],t.x,t.y)
             if not good then halt("Pemeriksaan lahan native gagal.");return end
             if allowed~=true then
+                do -- PATCH 1179 diagnosa: kenapa canPlace menolak? catat tetangga, tanah, dan posisi pemain
+                    local function tid(tx,ty,layer) local v=farmTile(n,tx,ty,layer);return v==nil and "nil" or tostring(v) end
+                    local key0=t.y*n.width+t.x
+                    traceMotion(string.format("canPlace DITOLAK (%d,%d) player=%.2f,%.2f fg[kiri,tengah,kanan]=%s,%s,%s bawah=%s bg=%s trees[kiri,kanan]=%s,%s",
+                        t.x,t.y,x,y,tid(t.x-1,t.y),tid(t.x,t.y),tid(t.x+1,t.y),tid(t.x,t.y+1),tid(t.x,t.y,"bg"),
+                        typeof(rawget(n.trees,key0-1)),typeof(rawget(n.trees,key0+1))))
+                end
                 f.orderCursor=t.key;f.target=nil;f.blockedOrder=nil;f.routeRetryAt=nil
                 farmNote="The game rejected planting on this tile; checking the next eligible tile.";return
             end
@@ -2592,6 +2730,7 @@ local function startFarm(preview,internal)
     f.motionEdges=f.motionEdges or {}
     if not preview then
         local signal=remotes:FindFirstChild("TreeChanged")
+            or {OnClientEvent={Connect=function() return {Disconnect=function() end} end}} -- PATCH 1179
         table.insert(f.connections,signal.OnClientEvent:Connect(function(tx,ty,record)
             if farm~=f then return end
             local a=f.action
