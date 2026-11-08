@@ -2887,25 +2887,26 @@ local function displayCount(records,id)
     end
     return count
 end
-local function loopInventory(a,reply,owner)
+local function loopInventory(a,reply,owner,b)
+    b=b or a.native.b
     local blocks,seeds=measure(reply,a.block),measure(reply,a.seed)
     local snapshot=reply and reply[1] and reply[2]
     local valid=blocks~=nil and seeds~=nil and type(snapshot)=="table"
         and integer(rawget(snapshot,"capacity")) and snapshot.capacity>0
-    if not valid and a.native.b.netCall and owner then
+    if not valid and b.netCall and owner then
         owner.snapshotStarted=owner.snapshotStarted or owner.job.started
         if os.clock()-owner.snapshotStarted<CONFIG.rpcTimeout then
             if os.clock()>=(owner.nextSnapshot or 0) then
-                owner.nextSnapshot=os.clock()+.25;request(owner,rpcFor(a.native.b,"GetInventory"))
+                owner.nextSnapshot=os.clock()+.25;request(owner,rpcFor(b,"GetInventory"))
             end
             farmNote="Menunggu snapshot inventory server; tahap dan antrean kolek dipertahankan."
             return nil
         end
     end
     if owner then owner.snapshotStarted,owner.nextSnapshot=nil,nil end
-    local synced,note=syncInventory(a.native.b,reply)
-    if blocks==nil or seeds==nil or not synced or inventoryNumber(a.native.b,"count",a.block)~=blocks
-        or inventoryNumber(a.native.b,"count",a.seed)~=seeds then
+    local synced,note=syncInventory(b,reply)
+    if blocks==nil or seeds==nil or not synced or inventoryNumber(b,"count",a.block)~=blocks
+        or inventoryNumber(b,"count",a.seed)~=seeds then
         halt("Inventory siklus belum sesuai server: "..tostring(note));return false
     end
     return cacheLoopSnapshot(reply)
@@ -3297,7 +3298,9 @@ local function loopTick()
         if f.lastScan and f.lastScan.ripe>0 then loopStage(a,"PANEN")
         elseif a.blocks>0 then loopStage(a,"PNB")
         elseif a.seeds>0 then loopStage(a,"TANAM") end
-        farmNote="Menunggu pohon matang; siklus tetap ON dan scan berlanjut."
+        farmNote=f.lastScan and f.lastScan.ripe==0 and f.lastScan.growing==0
+            and "Waiting for target blocks, seeds, or trees. Start Farm remains on."
+            or "Menunggu pohon matang; siklus tetap ON dan scan berlanjut."
     end
 end
 local function watchDisplay(a,f)
@@ -3327,6 +3330,30 @@ recoverLoop=function()
             or type(seed)~="table" or rawget(seed,"kind")~="seed" then
             farmNote="JEDA: pasangan blok + 1 belum cocok dengan ItemDB game.";return
         end
+        collecting=true;collectFilter,filterText=nil,"ALL";filterInput.Text="ALL";collectButton.Text="Kolek: ON"
+        -- Bootstrap from backpack stock, even when no tree exists in this world.
+        -- A world/state replacement invalidates any earlier snapshot.
+        if p.binding and (p.binding.state~=b.state or p.inventoryWorld~=world) then
+            p.job=nil;p.inventoryReady=nil
+        end
+        p.binding,p.inventoryWorld=b,world;p.retryAt=0
+        if not p.job then
+            p.inventoryReady=nil
+            local remote=rpcFor(b,"GetInventory")
+            if not remote then farmNote="Waiting for server inventory access.";return end
+            farmNote="Reading backpack inventory before starting farm actions."
+            request(p,remote);p.retryAt=0;return
+        end
+        if not p.job.done then farmNote="Waiting for the server inventory snapshot.";return end
+        if not p.inventoryReady then
+            local valid=loopInventory(a,p.job.reply,p,b)
+            if not valid then
+                if valid==false then p.job=nil;p.retryAt=os.clock()+2 end
+                return
+            end
+            p.inventoryReady=true
+        end
+        p.retryAt=os.clock()+2
         local display,why=displayBinding(b)
         if not display then farmNote="JEDA: "..why;return end
         if a.deposit and a.deposit.phase~="before" and not display.remote then farmNote="JEDA: "..display.reason;return end
@@ -3337,11 +3364,13 @@ recoverLoop=function()
         farmModeButton.Text="Tanam + Panen";startFarm(false,true)
         loopButton.Text="Siklus otomatis: ON"
         if not farm or not farm.native.buildRange then
+            p.job=nil;p.inventoryReady=nil
             farmNote="JEDA: pengikatan gerak/plant/hit belum tersedia; akan diperiksa ulang.";return
         end
         local ready,s=pcall(farm.native.getState)
         if not ready or type(s)~="table" or s.active~=true or s.dead~=false then
-            stopFarm();farmNote="JEDA: menunggu karakter aktif/hidup; siklus tetap ON.";return
+            stopFarm();p.job=nil;p.inventoryReady=nil
+            farmNote="JEDA: menunggu karakter aktif/hidup; siklus tetap ON.";return
         end
         a.native,a.display=farm.native,display
         if a.world~=world then a.capacityDrops=nil;a.blockedHome=nil end
@@ -3350,11 +3379,11 @@ recoverLoop=function()
         layer=a.layer;layerButton.Text="Layer: "..layer:upper()
         a.prep=nil;a.prepare=true;a.job=nil
         watchDisplay(a,farm);p.session=true;p.retryAt=0
-        request(p,rpcFor(b,"GetInventory"));return
     end
     if not p.job then request(p,rpcFor(a.native.b,"GetInventory"));return end
     if not p.job.done then farmNote="JEDA: menunggu snapshot inventory server; siklus tetap ON.";return end
-    local inventoryReady=loopInventory(a,p.job.reply,p)
+    local inventoryReady=p.inventoryReady or loopInventory(a,p.job.reply,p)
+    p.inventoryReady=nil
     if not inventoryReady then
         if inventoryReady==false then p.session=false;p.job=nil;p.retryAt=os.clock()+2 end
         return
@@ -3377,7 +3406,12 @@ recoverLoop=function()
         end
     elseif d then a.deposit,a.box=nil,nil end
     local resume=a.resumeStage
-    if resume~="TANAM" and resume~="PANEN" and resume~="TUNGGU" and resume~="PNB" then resume="CEK" end
+    if resume~="TANAM" and resume~="PANEN" and resume~="TUNGGU" and resume~="PNB" then
+        if a.seeds>=200 then resume="CEK" -- Preserve the storage transaction gate before planting.
+        elseif a.blocks>0 or a.prepare and farmTile(a.native,a.home.tx,a.home.ty,a.layer)==a.block then resume="PNB"
+        elseif a.seeds>0 then resume="TANAM"
+        else resume="TUNGGU" end
+    end
     a.paused=nil;a.resumeStage=nil;a.nextCheck=os.clock()+1;a.progressAt=os.clock()
     collecting=true;collectFilter,filterText=nil,"ALL";filterInput.Text="ALL"
     runButton.Text="PNB: OFF";collectButton.Text="Kolek: ON";farmButton.Text="Auto Farm: ON"
@@ -3593,7 +3627,7 @@ onAction(loopButton,function()
     end
     local a={block=id,seed=id+1,hits=hits,interval=interval,stage="JEDA",nextCheck=0,deposits=0,prepare=true,
         progressAt=os.clock(),paused={reason="Mulai",retryAt=0,at=os.clock()}}
-    autoLoop=a;loopButton.Text="Siklus otomatis: ON"
+    autoLoop=a;seedInput.Text=tostring(a.seed);loopButton.Text="Siklus otomatis: ON"
     recoverLoop()
     log("SIKLUS ON: PNB -> TANAM satu per satu -> PANEN satu per satu -> PNB; tetap ON sampai dihentikan manual.");report(true)
 end)
