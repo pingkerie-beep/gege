@@ -103,21 +103,35 @@ function compatibility.alias(fn,template,markers,arity)
     compatibility.aliases[template]=actual
     return true
 end
+-- A detached module is accepted only through a controller already matched to
+-- the local renderer, GUI, goTo closure and native position cells.
+function compatibility.module(b,fn,template,markers,arity)
+    if not template and b.runtime then template=functionOwner(fn) end
+    if compatibility.alias(fn,template,markers,arity) then return template end
+    return nil
+end
+function compatibility.context(b)
+    if not b or not b.gameGui or not b.gameGui:IsDescendantOf(playerGui) or not b.camera
+        or not b.camera:IsDescendantOf(b.gameGui) then return false end
+    return b.controller.Parent==b.gameGui
+        or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")
+        or b.runtime==true and functionOwner(b.renderer)==b.controller and rawget(b.state,"goTo")==b.positionFn
+end
 function compatibility.others(b)
     if b.others then return b.others end
     local template=b.gameGui and b.gameGui:FindFirstChild("Others")
     for _,value in pairs(upvalues(rawget(b.state,"enter")) or {}) do
         if type(value)=="table" then
             local update,sendHit=rawget(value,"update"),rawget(value,"sendHit")
-            if compatibility.alias(update,template,{"seen","group","nameBox"},4)
-                and ownedArity(sendHit,template,2) and hasConstants(sendHit,{"act","send","kind"}) then
+            local module=compatibility.module(b,update,template,{"seen","group","nameBox"},4)
+            if module and ownedArity(sendHit,module,2) and hasConstants(sendHit,{"act","send","kind"}) then
                 local uv=upvalues(update);local sender=uv and uv[1]
-                if ownedArity(sender,template,1) and hasConstants(sender,{"state","move","send","flags"}) then
+                if ownedArity(sender,module,1) and hasConstants(sender,{"state","move","send","flags"}) then
                     local sv=upvalues(sender);local config=sv and sv[1]
                     local getter=type(config)=="table" and rawget(config,"state")
                     local gv=ownedArity(getter,b.controller,0) and upvalues(getter)
                     if gv and gv[1]==b.state and hasConstants(getter,{"active","x","y","vx","vy","dead"}) then
-                        b.others,b.stateGetter,b.network=value,getter,sv[5]
+                        b.others,b.stateGetter,b.network,b.othersOwner=value,getter,sv[5],module
                         return value
                     end
                 end
@@ -170,7 +184,7 @@ function compatibility.renderer(gui,allowMenu)
                 and (allowMenu or type(rawget(state,"fg"))=="table" and integer(rawget(state,"w")) and integer(rawget(state,"h"))) then
                 if found then return nil end
                 found={controller=owner,template=gui:FindFirstChild("Game"),gameGui=gui,
-                    state=state,renderer=fn,positionFn=goTo,camera=camera}
+                    state=state,renderer=fn,positionFn=goTo,camera=camera,runtime=gui:FindFirstChild("Game")==nil}
             end
         end
     end
@@ -284,7 +298,7 @@ local function nativeStateSnapshot(b)
     if not b.stateGetter then
         local others=compatibility.others(b)
         local update=type(others)=="table" and rawget(others,"update")
-        local module=b.gameGui and b.gameGui:FindFirstChild("Others")
+        local module=b.othersOwner or b.gameGui and b.gameGui:FindFirstChild("Others")
         local uv=module and ownedArity(update,module,4) and upvalues(update)
         local sender=uv and uv[1]
         local sv=module and ownedArity(sender,module,1) and hasConstants(sender,{"state","move","send","flags"}) and upvalues(sender)
@@ -300,7 +314,7 @@ local function nativeStateSnapshot(b)
     return s
 end
 local function nativePosition(b)
-    if not b or not b.renderer or not b.camera:IsDescendantOf(playerGui) or not (b.controller.Parent==b.gameGui or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")) then return nil end
+    if not b or not b.renderer or not compatibility.context(b) then return nil end
     local values=upvalues(b.renderer)
     if not values or values[1]~=b.state then return nil end
     local x,y,hp=values[20],values[21],values[37]
@@ -343,7 +357,7 @@ end
 local function bind(force)
     local gameGui=playerGui:FindFirstChild("GameGui")
     local controller=gameGui and gameGui:FindFirstChild("Game")
-    if binding and controller and binding.gameGui==gameGui and (binding.controller==controller or binding.template==controller) and binding.camera:IsDescendantOf(playerGui)
+    if binding and binding.gameGui==gameGui and compatibility.context(binding)
         and not force then return binding end
     if not force and os.clock()-lastBind<2 then return nil end
     lastBind=os.clock();binding=nil
@@ -483,7 +497,7 @@ local function bind(force)
             and hudFunction(rawget(hud,"addGems")) and hudFunction(rawget(hud,"setGems"))
             and functionOwner(rawget(hud,"addGems"))==functionOwner(rawget(hud,"setGems")) then huds[hud]=true end
     end
-    if chatModule and chatModule:IsA("ModuleScript") then
+    if chatModule and chatModule:IsA("ModuleScript") or b.runtime then
         -- P169 S.console is a stable single-upvalue wrapper around ChatUI.add.
         local console=rawget(b.state,"console")
         table.insert(bindingNotes,"S.console "..functionDescription(console))
@@ -520,13 +534,13 @@ local function bind(force)
     local shared=RS:FindFirstChild("Shared")
     local module=shared and shared:FindFirstChild("Inventory")
     local getter=rawget(b.state,"backpackNow")
-    if module and ownedArity(getter,controller,0) and hasConstants(getter,{"slots","id","n"}) then
+    if ownedArity(getter,controller,0) and hasConstants(getter,{"slots","id","n"}) then
         local values=upvalues(getter)
         local inv=values and values[1]
         if type(inv)=="table" then
-            compatibility.alias(read(inv,"room"),module,{},2)
+            module=compatibility.module(b,read(inv,"room"),module,{},2)
         end
-        if type(inv)=="table" and ownedArity(read(inv,"room"),module,2)
+        if module and type(inv)=="table" and ownedArity(read(inv,"room"),module,2)
             and ownedArity(read(inv,"count"),module,2) then
             b.inventory=inv
             if ownedArity(read(inv,"add"),module,3) and ownedArity(read(inv,"remove"),module,3) then
@@ -698,7 +712,7 @@ local function worldDrop(b,r)
     return integer(uid) and uid>=0 and integer(id) and id>0 and integer(n) and n>0
         and finite(x) and finite(y) and not rawget(r,"display")
         and typeof(frame)=="Instance" and frame:IsDescendantOf(b.camera)
-        and (id~=112 or frame:FindFirstChild("Gem")~=nil or b.template~=nil and type(b.network)=="table")
+        and (id~=112 or frame:FindFirstChild("Gem")~=nil or (b.template~=nil or b.runtime) and type(b.network)=="table")
 end
 local function validDrop(b,r)
     return worldDrop(b,r) and rawget(r,"armed")~=false and not rawget(r,"taking") and not rawget(r,"pending")
@@ -1502,6 +1516,7 @@ local function farmBinding(b)
     local sfxModule=shared and shared:FindFirstChild("Sfx")
     local sfx=values and values[11]
     local play=type(sfx)=="table" and rawget(sfx,"play")
+    sfxModule=compatibility.module(b,play,sfxModule,{},nil)
     local materials
     for _,value in pairs(hv) do
         local palette=type(value)=="table" and rawget(value,0)
@@ -1513,7 +1528,7 @@ local function farmBinding(b)
     local default=type(materials)=="table" and rawget(materials,0)
     b.pnbSound=false
     if sfxModule and type(play)=="function" then compatibility.alias(play,sfxModule,{},nil) end
-    if sfxModule and sfxModule:IsA("ModuleScript") and type(play)=="function" and ownerMatches(play,sfxModule)
+    if sfxModule and (sfxModule:IsA("ModuleScript") or b.runtime) and type(play)=="function" and ownerMatches(play,sfxModule)
         and hv[3]==sfx and pv[12]==sfx and type(default)=="table"
         and type(rawget(default,"hit"))=="string" and type(rawget(default,"broke"))=="string"
         and hasConstants(act,{"play","tile_created"}) and hasConstants(hit,{"material","hit","broke","tile_removed"}) then
@@ -1551,7 +1566,7 @@ local function farmBinding(b)
     end
     if not trees then return nil,"Tabel tanaman aktif belum cocok." end
     local gameGui=b.gameGui
-    local module=gameGui:FindFirstChild("Others")
+    local module=b.othersOwner or gameGui:FindFirstChild("Others")
     local enter=rawget(b.state,"enter")
     local ev=ownedArity(enter,controller,2) and upvalues(enter)
     local others=compatibility.others(b) or ev and ev[5]
@@ -2903,8 +2918,8 @@ local function displayBinding(b)
         if ownedArity(cb.fn,b.controller,3) and hasConstants(cb.fn,{"displays","set","syncDisplay"})
             and cb.up[1]==b.state then handler=true end
     end
-    if areaModule then compatibility.alias(mayBuild,areaModule,{},3) end
-    if module then compatibility.alias(get,module,{},2) end
+    areaModule=compatibility.module(b,mayBuild,areaModule,{},3)
+    module=compatibility.module(b,get,module,{},2)
     local permission=areaModule and ownedArity(mayBuild,areaModule,3)
     local putMarkers=pv and hasConstants(put,{"count","backpackNow","remove","object_spawn2","spawn"})
     -- The v1012 display closure calls state.call and captures its history in slot 4.
@@ -3531,10 +3546,10 @@ do
         return value:upper()
     end
     local function menuEntry(b)
-        if not b or not (b.controller.Parent==b.gameGui or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")) or not b.gameGui:IsDescendantOf(playerGui) then return nil end
+        if not compatibility.context(b) then return nil end
         local module=b.gameGui:FindFirstChild("WorldMenu")
         local door=rawget(b.state,"useDoor")
-        if not module or not module:IsA("ModuleScript") or not ownedArity(door,b.controller,4)
+        if not ownedArity(door,b.controller,4)
             or not hasConstants(door,{"doors","get","areas","mayBuild","doorZoom"}) then return nil end
         local dv=upvalues(door)
         if not dv or dv[1]~=b.state then return nil end
@@ -3547,11 +3562,12 @@ do
                 local enter=rawget(candidate,"enter")
                 local blocking=rawget(candidate,"blocking")
                 local ok,arity,vararg=pcall(debug.info,enter,"a")
+                local menuModule
                 if ok and not vararg and (arity==1 or arity==2) then
-                    compatibility.alias(enter,module,{},arity)
+                    menuModule=compatibility.module(b,enter,module,{},arity)
                 end
-                if ownerMatches(enter,module) and ok and not vararg and (arity==1 or arity==2)
-                    and ownedArity(blocking,module,0) and hasConstants(blocking,{"Visible"}) then
+                if menuModule and ownerMatches(enter,menuModule) and ok and not vararg and (arity==1 or arity==2)
+                    and ownedArity(blocking,menuModule,0) and hasConstants(blocking,{"Visible"}) then
                     local ev,bv=upvalues(enter),upvalues(blocking)
                     local picker,input
                     for j=1,24 do
@@ -3567,7 +3583,7 @@ do
                     if picker and input and input:IsDescendantOf(picker) and parent
                         and parent:IsA("ScreenGui") and parent.Name=="MenuGui" and parent.Parent==playerGui then
                         if found and found~=candidate then return nil end
-                        found,entry,panel,field,screen=candidate,enter,picker,input,parent
+                        found,entry,panel,field,screen,module=candidate,enter,picker,input,parent,menuModule
                     end
                 end
             end
@@ -3578,7 +3594,7 @@ do
         if not b then return nil end
         local c=b.worldReturnSurface
         local function valid()
-            return c and c.module.Parent==b.gameGui and b.gameGui:IsDescendantOf(playerGui)
+            return c and (c.module.Parent==b.gameGui or b.runtime and c.module.Parent==nil) and compatibility.context(b)
                 and rawget(c.menu,"enter")==c.enter and rawget(c.menu,"blocking")==c.blocking
                 and ownerMatches(c.enter,c.module) and ownerMatches(c.blocking,c.module)
                 and c.picker.Parent==c.screen and c.screen.Parent==playerGui
@@ -15965,7 +15981,7 @@ return RayfieldLibrary
             local world=gui and gui:FindFirstChild("World")
             local camera=world and world:FindFirstChild("Camera")
             local tag=camera and camera:FindFirstChild("NameTag")
-            if not isGui(tag,"Frame") and binding and binding.template and binding.gameGui==gui then
+            if not isGui(tag,"Frame") and binding and (binding.template or binding.runtime) and binding.gameGui==gui then
                 local values=type(binding.renderer)=="function" and upvalues(binding.renderer)
                 local nativeTag,bitmap=values and values[76],values and values[77]
                 local frame=type(bitmap)=="table" and rawget(bitmap,"frame")
@@ -16046,9 +16062,51 @@ return RayfieldLibrary
         end}
     end
 
+        -- Own only this idle listener. No farm state, movement, remotes or timers.
+    do
+        local idle={enabled=true,status="On",lastAttempt=-math.huge}
+        local connection,destroyed
+        ui.antiAFK=idle
+        local function inputService()
+            local service=game:GetService("VirtualUser")
+            assert(type(service.CaptureController)=="function" and type(service.ClickButton2)=="function")
+            return service
+        end
+        local function onIdle()
+            if destroyed or not alive or not idle.enabled or os.clock()-idle.lastAttempt<60 then return end
+            local focusedOK,focused=pcall(function() return Input:GetFocusedTextBox() end)
+            if not focusedOK or focused then idle.status="Waiting until typing finishes";return end
+            idle.lastAttempt=os.clock()
+            local ok=pcall(function()
+                local service=inputService()
+                service:CaptureController()
+                -- Atomic right-button pulse at the screen corner; no held key,
+                -- avatar displacement, or left-click farm action is introduced.
+                service:ClickButton2(Vector2.new(0,0))
+            end)
+            idle.status=ok and "On" or "Unavailable on this executor"
+        end
+        function idle.Set(value)
+            if destroyed then return end
+            idle.enabled=value==true
+            if connection then pcall(function() connection:Disconnect() end);connection=nil end
+            if not idle.enabled then idle.status="Off";return end
+            local ok,service=pcall(inputService)
+            if not ok or not service then idle.status="Unavailable on this executor";return end
+            local connected,result=pcall(function() return player.Idled:Connect(onIdle) end)
+            if connected and result then connection=result;idle.status="On"
+            else idle.status="Idle events unavailable on this executor" end
+        end
+        function idle.Destroy()
+            if destroyed then return end
+            idle.Set(false);destroyed=true
+        end
+    end
+
     ui.Destroy=function()
         ui.ready=false
         ui.usernamePrivacy.Destroy()
+        ui.antiAFK.Destroy()
         if type(library.Destroy)=="function" then library:Destroy() end
     end
     ui.logoAsset=genhubLogoAsset()
@@ -16157,17 +16215,19 @@ return RayfieldLibrary
             if data[key]~=nil and type(data[key])~="boolean" then return nil,"Effect settings must be on or off." end
         end
         if data.hideUsername~=nil and type(data.hideUsername)~="boolean" then return nil,"Hide Username must be on or off." end
+        if data.antiAFK~=nil and type(data.antiAFK)~="boolean" then return nil,"Anti AFK must be on or off." end
         local scale=data.uiScale==nil and defaultScale or data.uiScale
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
         return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
-            hideUsername=data.hideUsername==true,autoJoinWorld=data.autoJoinWorld==true,targetWorld=targetWorld,startFarm=data.startFarm==true}
+            hideUsername=data.hideUsername==true,autoJoinWorld=data.autoJoinWorld==true,targetWorld=targetWorld,startFarm=data.startFarm==true,
+            antiAFK=data.antiAFK~=false}
     end
     local function currentConfig()
         return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
             soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername,
-            autoJoinWorld=ui.autoJoinWorld,targetWorld=ui.targetWorld,startFarm=worldStartup.wantsFarm()})
+            autoJoinWorld=ui.autoJoinWorld,targetWorld=ui.targetWorld,startFarm=worldStartup.wantsFarm(),antiAFK=ui.antiAFK.enabled})
     end
     local function settingInput(title,control,hint)
         local widget=settingsTab:CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
@@ -16202,6 +16262,10 @@ return RayfieldLibrary
         worldStartup.setFarm(value);ui.Sync(true);report(true)
     end})
     settingsTab:CreateParagraph({Title="Automatic Startup",Content="Set a target world and enable Auto Join World. Start Farm and Auto Start Farm control the same saved on/off state. Save Config, then keep Auto Load enabled to restore it next run. Farming waits for the target world, character, and server inventory."})
+    local antiAFKToggle=settingsTab:CreateToggle({Name="Anti AFK",CurrentValue=true,Callback=function(value)
+        if ui.updating then return end
+        ui.antiAFK.Set(value);ui.Sync(true)
+    end})
     settingsTab:CreateSection("Interface")
     local privacyToggle=settingsTab:CreateToggle({Name="Hide Username",CurrentValue=false,Callback=function(value)
         if ui.updating then return end
@@ -16283,7 +16347,7 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
-    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, target world, Auto Join World, Start Farm on/off state, PNB and collection settings, effects, UI size, and Hide Username. Auto Load restores them next run. Turn Start Farm off to cancel farming, including a queued automatic start."})
+    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, target world, Auto Join World, Start Farm on/off state, Anti AFK, PNB and collection settings, effects, UI size, and Hide Username. Auto Load restores them next run. Turn Start Farm off to cancel farming, including a queued automatic start."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
         local b=bind(false)
@@ -16413,6 +16477,7 @@ return RayfieldLibrary
         table.insert(status,"PNB animations: "..(not effects.hands and "Off" or binding and type(binding.pnbAnimation)=="table" and not binding.pnbAnimation.disabled and "Ready" or "Unavailable"))
         table.insert(status,"PNB sounds: "..(not effects.sounds and "Off" or binding and type(binding.pnbSound)=="table" and not binding.pnbSound.disabled and "Ready" or "Unavailable"))
         table.insert(status,"Block break effects: "..(not effects.blocks and "Off" or binding and type(binding.pnbBlockEffects)=="table" and not binding.pnbBlockEffects.disabled and "Ready" or "Unavailable"))
+        table.insert(status,"Anti AFK: "..ui.antiAFK.status)
         table.insert(status,"Pickup distance is controlled by the server.")
         paragraph(detail,"Full Status",table.concat(status,"\n"))
         paragraph(configInfo,"Configuration Status",ui.configStatus)
@@ -16420,6 +16485,7 @@ return RayfieldLibrary
         ui.updating=true
         if scaleSlider.CurrentValue~=ui.uiScale then scaleSlider:Set(ui.uiScale) end
         if privacyToggle.CurrentValue~=ui.hideUsername then privacyToggle:Set(ui.hideUsername) end
+        if antiAFKToggle.CurrentValue~=ui.antiAFK.enabled then antiAFKToggle:Set(ui.antiAFK.enabled) end
         if row and dropdown.CurrentOption[1]~=row.label then dropdown:Set({row.label}) end
         local wanted=worldStartup.wantsFarm()
         if cycleToggle.CurrentValue~=wanted then cycleToggle:Set(wanted) end
@@ -16431,7 +16497,7 @@ return RayfieldLibrary
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
         ui.updating=false
     end
-    ui.Rebuild();ui.Search();ui.ready=true
+    ui.Rebuild();ui.Search();ui.ready=true;ui.antiAFK.Set(true)
     local initial=ui.byId[tonumber(idInput.Text)] or (ui.byId[4] and ui.byId[4].available and ui.byId[4])
     if not initial then for _,row in ipairs(ui.rows) do if row.available then initial=row;break end end end
     if initial then ui.Select(initial.id) end
@@ -16455,6 +16521,7 @@ return RayfieldLibrary
                     effects.sounds,effects.hands,effects.blocks=valid.soundEffects,valid.handAnimations,valid.blockEffects
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
                     ui.hideUsername=valid.hideUsername;ui.usernamePrivacy.Set(ui.hideUsername)
+                    ui.antiAFK.Set(valid.antiAFK)
                     ui.autoJoinWorld,ui.targetWorld=valid.autoJoinWorld,valid.targetWorld
                     worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld)
                     ui.configStatus="Saved configuration loaded."
