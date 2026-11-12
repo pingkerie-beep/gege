@@ -444,8 +444,8 @@ local function bind(force)
     local dropValues=upvalues(b.dropFn)
     local dropList=dropValues and dropValues[b.dropIndex]
     local setters={}
-    -- Game P210 DropTaken captures P57 setDropCount in upvalue 3.
-    -- P61's successful native pickup invokes this same local completion function.
+    -- DropTaken captures the same setDropCount used by native pickup.
+    -- Newer versions capture item metadata before the active drop list.
     for _,callback in ipairs(takenCallbacks) do
         local setter=callback.up[3]
         local setterUp=upvalues(setter)
@@ -453,7 +453,7 @@ local function bind(force)
             and hasConstants(callback.fn,{"uid","n","dropArrived","id"})
             and ownedArity(setter,controller,2)
             and hasConstants(setter,{"n","setGem","count","find","remove","Destroy"})
-            and setterUp and setterUp[1]==dropList then
+            and captures(setterUp,dropList) then
             setters[setter]=true
         end
     end
@@ -3753,7 +3753,16 @@ function worldStartup.worldName(value)
     if #value<1 or #value>64 or value:find("[^%w_%-]") then return nil end
     return value
 end
+function worldStartup.destination(value)
+    if type(value)~="string" then return nil end
+    value=value:match("^%s*(.-)%s*$")
+    local world,door=value:match("^([^:]+):([^:]+)$")
+    world=worldStartup.worldName(world or value)
+    if not world or door and (door:find("%c") or not door:find("%S")) then return nil end
+    return door and (world..":"..door) or world,world,door
+end
 function worldStartup.cancelFarm()
+    if worldStartup.stopLink then worldStartup.stopLink() end
     worldStartup.farmWanted=false;worldStartup.manualStart=false
     worldStartup.stableAt=nil;worldStartup.stableWorld=nil
 end
@@ -3766,13 +3775,24 @@ function worldStartup.setFarm(value,automatic)
     worldStartup.manualStart=value==true and automatic~=true
     worldStartup.stableAt=nil;worldStartup.stableWorld=nil
     if value~=true then
+        if worldStartup.stopLink then worldStartup.stopLink() end
         if autoLoop and uiActions.AutoCycle then uiActions.AutoCycle() end
         worldStartup.status=""
     elseif worldStartup.tick then worldStartup.tick() end
 end
-function worldStartup.setJoin(enabled,world)
+function worldStartup.setJoin(enabled,world,link)
+    local wasEnabled=worldStartup.autoJoin
     worldStartup.autoJoin=enabled==true
-    worldStartup.targetWorld=worldStartup.worldName(world) or ""
+    if not wasEnabled and worldStartup.autoJoin then worldStartup.linkTried=nil end
+    local target=worldStartup.destination(world) or ""
+    link=worldStartup.worldName(link) or ""
+    if target~=worldStartup.targetWorld or link~=(worldStartup.worldLink or "") then
+        if worldStartup.stopLink then worldStartup.stopLink() end
+        worldStartup.linkTried=nil
+        worldStartup.enteredDoor=nil;worldStartup.checkDoor=nil;worldStartup.nextDoorCheck=nil
+        worldStartup.joinStatus=nil;worldStartup.attempts=0
+    end
+    worldStartup.targetWorld,worldStartup.worldLink=target,link
     worldStartup.nextAttempt=0
     worldStartup.stableAt=nil
 end
@@ -3787,64 +3807,395 @@ function worldStartup.menuBinding(b)
     worldStartup.menuContext=context
     return context
 end
+local function joinAtDoor(context,enter,world,door)
+    local state=context.state
+    local native=rawget(state,"enter")
+    local values=upvalues(native)
+    if not ownedArity(native,context.controller,2) or not values or values[1]~=state
+        or not hasConstants(native,{"arriveDoor","InvokeServer","arrive","teleport","setWorld"}) then
+        return false,"Door entry is unavailable in this game version."
+    end
+    local linked=false
+    for _,value in pairs(upvalues(enter) or {}) do
+        if type(value)=="table" and rawget(value,"enter")==native then linked=true;break end
+    end
+    if not linked then return false,"The world menu has no verified door-entry route." end
+    if rawget(state,"arriveDoor")~=nil then return false,"The game has an arrival pending." end
+    local beforeGrid=rawget(state,"fg")
+    local beforePortal=rawget(state,"portalIn")
+    log(string.format("DOOR ENTRY request | world=%q | id=%q",world,door:sub(1,64)))
+    -- The game uses this one-shot field to pass a door through its world menu.
+    rawset(state,"arriveDoor",door)
+    local ok,result=pcall(enter,world)
+    local pendingDoor=rawget(state,"arriveDoor")
+    if pendingDoor==door then rawset(state,"arriveDoor",nil) end
+    local pos=upvalues(context.positionFn)
+    local spawn=rawget(state,"spawn")
+    log(string.format("DOOR ENTRY return | wrapper=%s | id consumed=%s | world=%s | grid replaced=%s | pos=%s,%s | spawn tile=%s,%s | portal=%s -> %s",
+        ok and tostring(result) or "error",tostring(pendingDoor==nil),tostring(rawget(state,"name")),
+        tostring(beforeGrid~=rawget(state,"fg")),tostring(pos and pos[1]),tostring(pos and pos[2]),
+        tostring(read(spawn,"X")),tostring(read(spawn,"Y")),tostring(beforePortal),tostring(rawget(state,"portalIn"))))
+    if not ok then return false,tostring(result) end
+    return pendingDoor==nil and result~=false
+end
+local function beginJoin(s,context,enter,target,world,door)
+    local job={target=target,door=door}
+    s.job=job;s.joinStatus=nil;s.enteredDoor=nil;s.checkDoor=nil;s.nextDoorCheck=nil
+    s.stableAt=nil;s.stableWorld=nil
+    s.status="Joining "..target.."."
+    request(job,function()
+        if door then return joinAtDoor(context,enter,world,door) end
+        return enter(world)
+    end)
+end
+local function doorRecord(state,x,y)
+    local doors=rawget(state,"doors")
+    if type(doors)~="table" then return nil end
+    local get,load=read(doors,"get"),read(doors,"load")
+    local owner=functionOwner(get)
+    if typeof(owner)~="Instance" or not ownedArity(get,owner,2) or not ownedArity(load,owner,3) then return nil end
+    local ok,record=pcall(get,x,y)
+    if ok and type(record)=="table" then return record end
+end
+local function doorArrival(b,x,y,id)
+    local tx,ty=math.floor(x),math.floor(y-.475)
+    local state=b.state
+    local record=doorRecord(state,tx,ty)
+    if record and rawget(record,"id")==id then return true end
+    local spawn=rawget(state,"spawn")
+    return false,read(spawn,"X")==tx and read(spawn,"Y")==ty,record
+end
+do
+    local s=worldStartup
+    local function releaseKey(trip)
+        if not trip or not trip.key then return end
+        local key=trip.key
+        trip.key=nil
+        local ok,sent=pcall(trip.sendKey,key,false)
+        if not ok or sent==false then pcall(trip.sendKey,key,false) end
+    end
+    function s.stopLink()
+        local trip=s.linkTrip
+        if trip then s.linkTried=trip.link end
+        releaseKey(trip)
+        s.linkTrip=nil
+    end
+    function s.linkFocusLost()
+        releaseKey(s.linkTrip)
+        s.linkBlurred=true
+    end
+    if Input.WindowFocused then connect(Input.WindowFocused,function() s.linkBlurred=false end) end
+    local function fail(trip,message)
+        s.stopLink()
+        s.linkTried=trip.link;s.joinStatus=message;s.status=message
+        log(message)
+    end
+    local function inputSenders()
+        local senders={}
+        local active=type(iswindowactive)=="function" and iswindowactive or isrbxactive
+        if type(active)=="function" and type(keypress)=="function" and type(keyrelease)=="function" then
+            senders[#senders+1]={name="keyboard",send=function(key,down)
+                local code=key==Enum.KeyCode.A and 0x41 or 0x44
+                if down then
+                    assert(active(),"Roblox is not focused.")
+                    return keypress(code)
+                end
+                return keyrelease(code)
+            end}
+        end
+        local ok,virtual=pcall(function() return Input:CreateVirtualInput() end)
+        if ok and virtual and type(read(virtual,"SendKey"))=="function" then
+            senders[#senders+1]={name="virtual input",send=function(key,down) return virtual:SendKey(down,key,false) end}
+        end
+        return senders
+    end
+    local function walk(trip,key,x,now)
+        if now<(trip.retryWalkAt or 0) then return end
+        if trip.key and trip.key~=key then releaseKey(trip) end
+        if trip.key then
+            if math.abs(x-trip.progressX)>=.04 then trip.progressX,trip.progressAt=x,now end
+            if now-trip.progressAt<1.25 then return end
+            releaseKey(trip)
+            log("World Link: "..trip.senders[trip.senderIndex].name.." produced no movement. Trying another input.")
+            trip.senderIndex+=1
+        end
+        if not trip.senders then trip.senders=inputSenders();trip.senderIndex=1 end
+        for index=trip.senderIndex,#trip.senders do
+            local sender=trip.senders[index]
+            trip.sendKey,trip.key=sender.send,key
+            local ok,sent=pcall(sender.send,key,true)
+            if ok and sent~=false then
+                trip.senderIndex=index;trip.progressX,trip.progressAt=x,now
+                s.status="Walking to the link door in "..trip.link.."."
+                return
+            end
+            releaseKey(trip)
+            log("World Link: "..sender.name.." could not start walking. "..(ok and "Input rejected." or tostring(sent):sub(1,160)))
+        end
+        trip.walkRetries=(trip.walkRetries or 0)+1
+        if trip.walkRetries>=3 then
+            fail(trip,"Could not walk to the link door. Stand on it and press Join World to continue.")
+            return
+        end
+        trip.senders=nil;trip.retryWalkAt=now+.4*trip.walkRetries
+        s.status="Retrying movement to the link door."
+    end
+    local function findDoor(b,trip,bodyY)
+        local state=b.state
+        local grid,width=rawget(state,"fg"),rawget(state,"w")
+        if type(grid)~="table" or type(b.itemDB)~="table" or not integer(width) or width<1 then
+            return nil,"Waiting for the link world's map."
+        end
+        local row=rawget(grid,bodyY)
+        if type(row)~="table" then return nil,"Waiting for the link world's map." end
+        local exact,unknown,ambiguous={},{},false
+        for x=0,math.min(width,CONFIG.scanLimit)-1 do
+            local tile=rawget(row,x)
+            local item=tile and tile~=6 and rawget(b.itemDB,tile)
+            if type(item)=="table" and rawget(item,"door")==true and not rawget(item,"idOnly") then
+                local record=doorRecord(state,x,bodyY)
+                local dest=record and rawget(record,"dest")
+                if record and not rawget(record,"locked") then
+                    if type(dest)=="string" then
+                        local normalized,world=s.destination(dest:sub(1,1)==":" and trip.link..dest or dest)
+                        if normalized==trip.target or not trip.door and world==trip.world then table.insert(exact,x) end
+                    elseif rawget(record,"public")==true then table.insert(unknown,x)
+                    else ambiguous=true end
+                elseif not record then ambiguous=true end
+            end
+        end
+        if #exact==1 then return exact[1],nil,true end
+        if #exact==0 and #unknown==1 and not ambiguous then return unknown[1] end
+        return nil,"No unique accessible link door on this row. Check its Destination and public access."
+    end
+    function s.beginLink(target,world,door,link)
+        s.linkTrip={target=target or link,world=world or link,door=door,link=link,
+            follow=world~=nil and world~=link,deadline=os.clock()+15}
+        s.linkTried=nil;s.joinStatus=nil;s.enteredDoor=nil
+        s.checkDoor=nil;s.nextDoorCheck=nil
+        s.stableAt=nil;s.stableWorld=nil
+        s.status="Joining World Link "..link.."."
+    end
+    function s.tickLink(b,shown,enter,x,y,world)
+        local trip=s.linkTrip
+        if not trip then return false end
+        local now=os.clock()
+        if not trip.used and shown==false and world==trip.link and (s.linkBlurred or Input:GetFocusedTextBox()) then
+            releaseKey(trip)
+            trip.pausedAt=trip.pausedAt or now
+            s.status="Focus Roblox to continue World Link."
+            return true
+        end
+        if trip.pausedAt then trip.deadline+=now-trip.pausedAt;trip.pausedAt=nil end
+        if now>=trip.deadline then fail(trip,"World Link timed out before arrival at "..trip.target..".");return true end
+        if trip.job then
+            if not trip.job.done then return true end
+            local reply=trip.job.reply
+            trip.job=nil
+            if not reply[1] or reply[2]==false then fail(trip,"World Link entry failed for "..trip.target..".");return true end
+        end
+        if trip.used then
+            if shown~=false or not x or world~=trip.world then return true end
+            local matched,main,record=doorArrival(b,x,y,trip.door)
+            local tx,ty=math.floor(x),math.floor(y-.475)
+            local row=rawget(rawget(b.state,"fg"),ty)
+            local tile=type(row)=="table" and rawget(row,tx)
+            local item=tile and b.itemDB and rawget(b.itemDB,tile)
+            local verifiedLink=trip.exact and not main and not (record and rawget(record,"id"))
+                and tile~=6 and type(item)=="table" and rawget(item,"door")==true
+            if not trip.door or matched or verifiedLink then
+                s.stopLink()
+                s.linkTried=nil
+                s.enteredDoor=trip.target
+                s.joinStatus="Arrived at "..trip.target.." via "..trip.link.."."
+                s.status=s.joinStatus;currentWorld=world
+                log(s.joinStatus)
+            elseif main then fail(trip,"World Link reached the Main Door instead of "..trip.target..".")
+            else s.status="World Link reached "..world..". Checking the destination door." end
+            return true
+        end
+        if shown==true then
+            releaseKey(trip)
+            if not enter or (lease.outstanding or 0)>0 or Input:GetFocusedTextBox() then return true end
+            if trip.joined then fail(trip,"Could not enter World Link "..trip.link..".");return true end
+            trip.joined=true
+            s.status="Joining World Link "..trip.link.."."
+            request(trip,function()
+                if s.linkTrip~=trip then return false end
+                return enter(trip.link)
+            end)
+            return true
+        end
+        if shown~=false or not x then releaseKey(trip);return true end
+        if world~=trip.link then
+            fail(trip,"Open the world picker to join World Link "..trip.link..".")
+            return true
+        end
+        if not trip.follow then
+            s.stopLink();s.linkTried=nil
+            s.joinStatus="World Link "..trip.link.." ready."
+            s.status=s.joinStatus;currentWorld=world
+            log(s.joinStatus)
+            return true
+        end
+        local tx,ty=math.floor(x),math.floor(y-.475)
+        if trip.x==nil then
+            local goal,why,exact=findDoor(b,trip,ty)
+            if goal==nil then fail(trip,why);return true end
+            trip.x,trip.y,trip.exact=goal,ty,exact
+        end
+        if ty~=trip.y then fail(trip,"The link door must be reachable on the spawn row.");return true end
+        if tx==trip.x then
+            releaseKey(trip)
+            local state=b.state
+            local use=rawget(state,"useDoor")
+            local values=upvalues(use)
+            if not ownedArity(use,b.controller,4) or not values or values[1]~=state
+                or not hasConstants(use,{"doors","get","areas","mayBuild","doorZoom"}) then
+                fail(trip,"Native door interaction is unavailable.");return true
+            end
+            if rawget(state,"doorZoom") or (lease.outstanding or 0)>0 then return true end
+            local goal,why,exact=findDoor(b,trip,ty)
+            if goal~=tx then fail(trip,why or "The link door changed before interaction.");return true end
+            trip.exact=exact;trip.used=true;trip.deadline=now+15
+            s.status="Using the door from "..trip.link.." to "..trip.target.."."
+            request(trip,function()
+                local px,py,current=livePosition(b)
+                if s.linkTrip~=trip or not px or current~=trip.link
+                    or math.floor(px)~=tx or math.floor(py-.475)~=ty then return false end
+                local result=use(tx,ty)
+                log(string.format("World Link door (%d,%d): native call returned; transition=%s.",tx,ty,
+                    rawget(state,"doorZoom") and "started" or "not visible yet"))
+                return result
+            end)
+            return true
+        end
+        local key=trip.x<tx and Enum.KeyCode.A or Enum.KeyCode.D
+        walk(trip,key,x,now)
+        return true
+    end
+end
+function worldStartup.joinOnce()
+    local s=worldStartup
+    local target,world,door=s.destination(s.targetWorld)
+    local link=s.worldLink~="" and s.worldLink
+    if not target and not link then return false,"Enter a Target World or World Link first." end
+    if autoLoop or running or collecting or farm or pending then return false,"Stop the farm before joining another world." end
+    if s.job or s.linkTrip or (lease.outstanding or 0)>0 or Input:GetFocusedTextBox() then
+        return false,"Wait for the current request or text entry to finish."
+    end
+    local b=bind(false)
+    local context=s.menuBinding(b)
+    local shown,enter=worldReturn.surface(context)
+    if link then
+        if door and link==world then return false,"World Link must be a different world from Target World." end
+        local _,_,current=livePosition(b)
+        if shown~=true and current~=link then return false,"Open the world picker to join "..link.."." end
+        s.beginLink(target,world,door,link)
+        return true
+    end
+    if shown~=true or not enter then return false,"Open the game’s world picker first." end
+    beginJoin(s,context,enter,target,world,door)
+    return true
+end
 function worldStartup.tick()
     local s=worldStartup
     if not alive or not rayfieldUI or not rayfieldUI.ready then return false end
     if autoLoop then s.status="";return false end
-    if not s.job and not s.autoJoin and not s.farmWanted then s.status="";return false end
     local now=os.clock()
+    local finished
     if s.job then
-        if not s.job.done then s.status="Joining "..s.job.world..". Waiting for the server.";return true end
-        local job=s.job;s.job=nil;s.stableAt=nil;s.manualStart=false
-        if not job.reply[1] or job.reply[2]==false then
-            s.status="Could not join "..job.world..". Retrying when the world menu is ready."
-        end
+        local call=s.job.job
+        if not call.done then s.status="Joining "..s.job.target..". Waiting for the server.";return true end
+        finished=s.job;s.job=nil;s.stableAt=nil;s.manualStart=false
+    end
+    if not finished and not s.autoJoin and not s.farmWanted and not s.checkDoor and not s.enteredDoor and not s.linkTrip then
+        s.status=s.joinStatus or "";return false
     end
     if running or farm or pending then return false end
     local b=bind(false)
     local context=s.menuBinding(b)
     local shown,enter=worldReturn.surface(context)
+    local target,worldName,door=s.destination(s.targetWorld)
+    local link=s.worldLink~="" and s.worldLink
+    local x,y,world=livePosition(b)
+    if s.linkTrip then return s.tickLink(b,shown,enter,x,y,world) end
+    if s.autoJoin and link and not s.linkTried
+        and (shown==true or world==link and worldName and worldName~=link) then
+        if door and link==worldName then
+            s.status="World Link must be a different world from Target World.";return true
+        end
+        s.beginLink(target,worldName,door,link)
+        return s.tickLink(b,shown,enter,x,y,world)
+    end
+    if finished and finished.target==target then
+        local reply=finished.job.reply
+        if not reply[1] or reply[2]==false or shown==true then
+            s.joinStatus="Could not join "..target.."."
+            if reply[1] and type(reply[3])=="string" then s.joinStatus=s.joinStatus.." "..reply[3] end
+        elseif finished.door then
+            s.checkDoor=true
+            s.joinStatus="Checking arrival at "..target.."."
+        else s.joinStatus="World ready." end
+        if not s.autoJoin and not s.farmWanted and not s.checkDoor then s.status=s.joinStatus;return false end
+    end
     if shown==true then
         s.stableAt=nil;s.stableWorld=nil;s.manualStart=false
+        if s.enteredDoor or s.checkDoor then s.joinStatus=nil end
+        s.enteredDoor=nil;s.checkDoor=nil;s.nextDoorCheck=nil
         if not s.autoJoin then
-            s.status=s.farmWanted and "Waiting for a world to open before starting the farm." or ""
+            s.status=s.joinStatus or (s.farmWanted and "Waiting for a world to open before starting the farm." or "")
             return s.farmWanted
         end
-        local target=s.worldName(s.targetWorld)
-        if not target then s.status="Enter a Target World in Settings.";return true end
+        if link then s.status=s.joinStatus or s.status;return true end
+        if not target then s.status="Enter a Target World or World Link in Settings.";return true end
         if not enter then s.status="Waiting for the world menu to become ready.";return true end
         if (lease.outstanding or 0)>0 or Input:GetFocusedTextBox() then
             s.status="Waiting for the current request or text entry to finish.";return true
         end
-        if now<s.nextAttempt then s.status="Waiting to join "..target..".";return true end
+        if now<s.nextAttempt then s.status=s.joinStatus or ("Waiting to join "..target..".");return true end
         s.attempts=(s.attempts or 0)+1
         s.nextAttempt=now+math.min(15,3+s.attempts*2)
-        local job={world=target,started=now,done=false};s.job=job
-        lease.outstanding=(lease.outstanding or 0)+1
-        s.status="Joining "..target.."."
-        task.spawn(function()
-            job.reply=table.pack(pcall(enter,target))
-            job.done=true;lease.outstanding=math.max(0,(lease.outstanding or 1)-1)
-        end)
+        beginJoin(s,context,enter,target,worldName,door)
         return true
     end
     if shown==nil and s.farmWanted and not s.manualStart then
         s.status="Waiting for the world interface to become ready.";return true
     end
-    local x,y,world=livePosition(b)
     if not x then
         s.stableAt=nil
         s.status="Waiting for the character and world to become ready."
         return s.farmWanted or s.autoJoin and shown~=false
     end
-    local target=s.worldName(s.targetWorld)
-    if target and world~=target then
+    if target and world~=worldName then
         s.stableAt=nil;s.stableWorld=nil
-        s.status="Waiting for "..target..". Open the world menu to join it."
+        s.enteredDoor=nil
+        s.status=s.joinStatus or ("Waiting for "..target..". Open the world menu to join it.")
         return s.farmWanted
     end
-    if s.autoJoin and not target then s.status="Enter a Target World in Settings.";return s.farmWanted end
-    if not s.farmWanted then s.status="World ready.";s.attempts=0;return false end
+    if not target and link then
+        s.status=world==link and (s.farmWanted and "Set Target World before starting the farm." or "World Link "..link.." ready.")
+            or (s.joinStatus or ("Open the world picker to join "..link.."."))
+        return s.farmWanted
+    end
+    if s.autoJoin and not target then s.status="Enter a Target World or World Link in Settings.";return s.farmWanted end
+    if door and shown==false and s.enteredDoor~=target and (s.checkDoor or s.farmWanted)
+        and now>=(s.nextDoorCheck or 0) then
+        s.nextDoorCheck=now+.5;s.checkDoor=nil
+        local matched,main=doorArrival(b,x,y,door)
+        if matched then
+            s.enteredDoor=target;s.joinStatus="Arrived at "..target.."."
+        elseif main then
+            s.joinStatus="Entered "..worldName.." at the Main Door. Use an in-game door linked to "..target.."."
+        elseif not s.joinStatus or s.joinStatus=="Checking arrival at "..target.."." then
+            s.joinStatus="Arrival at "..target.." could not be verified. Check the destination in game."
+        end
+    end
+    if door and (s.enteredDoor~=target or shown~=false) then
+        s.status=s.joinStatus or ("Open the world menu to join "..target..".")
+        return s.farmWanted
+    end
+    if not s.farmWanted then s.status=s.joinStatus or "World ready.";s.attempts=0;return false end
     if s.stableWorld~=world then s.stableWorld=world;s.stableAt=now end
     if not s.manualStart and now-(s.stableAt or now)<.5 then
         s.status="World ready. Waiting for the character to settle.";return true
@@ -3863,7 +4214,6 @@ function worldStartup.tick()
     s.status=autoLoop and "Farm started. Checking server inventory." or "Waiting to start the farm."
     return autoLoop==nil
 end
-
 -- END WORLD STARTUP
 onAction(loopButton,function()
     if autoLoop then halt("Siklus otomatis OFF.",true);report(true);return end
@@ -3950,6 +4300,7 @@ connect(Input.InputBegan,function(input,processed)
     if not processed and input.KeyCode==Enum.KeyCode.H and not Input:GetFocusedTextBox() then halt("Stop [H].",true);report(true) end
 end)
 connect(Input.WindowFocusReleased,function()
+    if worldStartup.linkFocusLost then worldStartup.linkFocusLost() end
     if farm and not farm.preview then
         log("Auto Farm tetap aktif di latar; Stop/H untuk menghentikan.");report(true)
     else halt("Roblox kehilangan fokus; PNB/kolek OFF.");report(true) end
@@ -15966,7 +16317,7 @@ return RayfieldLibrary
     assert(type(library)=="table" and type(library.CreateWindow)=="function","Rayfield could not be loaded.")
     local defaultScale=Input.TouchEnabled and 75 or 100
     local ui={library=library,updating=false,ready=false,query="",page=1,pageSize=80,rows={},byId={},options={},
-        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,autoJoinWorld=false,targetWorld="",configStatus="No saved configuration."}
+        lastSync=-math.huge,autoLoad=true,uiScale=defaultScale,hideUsername=false,autoJoinWorld=false,targetWorld="",worldLink="",configStatus="No saved configuration."}
     rayfieldUI=ui
         -- Local nameplate visibility only; the game's player identity stays intact.
     do
@@ -16194,6 +16545,10 @@ return RayfieldLibrary
         end
         return count>0 and count<=32 and text or nil
     end
+    local function normalizeWorldLink(value)
+        if value==nil or type(value)=="string" and value:match("^%s*$") then return "" end
+        return worldStartup.worldName(value)
+    end
     local function validate(data)
         if type(data)~="table" or data.version~=1 or type(data.autoLoad)~="boolean" then return nil,"Invalid configuration format." end
         if not integer(data.targetId) or data.targetId<=0 then return nil,"Invalid Farmable Target." end
@@ -16204,8 +16559,15 @@ return RayfieldLibrary
         if data.targetWorld~=nil and type(data.targetWorld)~="string" then return nil,"Invalid Target World." end
         local targetWorld=data.targetWorld or ""
         if targetWorld:match("^%s*$") then targetWorld=""
-        else targetWorld=worldStartup.worldName(targetWorld);if not targetWorld then return nil,"Use up to 64 letters, numbers, underscores, or hyphens for Target World." end end
-        if data.autoJoinWorld==true and targetWorld=="" then return nil,"Enter a Target World before saving Auto Join World." end
+        else
+            targetWorld=worldStartup.destination(targetWorld)
+            if not targetWorld then return nil,"Use WORLD or WORLD:ID for Target World, for example KEWELYS:AWS." end
+        end
+        local worldLink=normalizeWorldLink(data.worldLink)
+        if not worldLink then return nil,"Enter a world name such as CERELO for World Link, or leave it blank." end
+        if data.autoJoinWorld==true and targetWorld=="" and worldLink=="" then
+            return nil,"Enter a Target World or World Link before saving Auto Join World."
+        end
         if not integer(data.hits) or data.hits<1 or data.hits>50 then return nil,"Hits per Block must be a whole number from 1 to 50." end
         if not finite(data.delay) or data.delay<.05 or data.delay>5 then return nil,"Action Delay must be between 0.05 and 5 seconds." end
         if not finite(data.range) or data.range<.5 or data.range>20 then return nil,"Collect Radius must be between 0.5 and 20 tiles." end
@@ -16220,14 +16582,14 @@ return RayfieldLibrary
         if not finite(scale) or scale<50 or scale>130 then return nil,"UI Scale must be between 50 and 130 percent." end
         return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
-            hideUsername=data.hideUsername==true,autoJoinWorld=data.autoJoinWorld==true,targetWorld=targetWorld,startFarm=data.startFarm==true,
+            hideUsername=data.hideUsername==true,autoJoinWorld=data.autoJoinWorld==true,targetWorld=targetWorld,worldLink=worldLink,startFarm=data.startFarm==true,
             antiAFK=data.antiAFK~=false}
     end
     local function currentConfig()
         return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
             soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername,
-            autoJoinWorld=ui.autoJoinWorld,targetWorld=ui.targetWorld,startFarm=worldStartup.wantsFarm(),antiAFK=ui.antiAFK.enabled})
+            autoJoinWorld=ui.autoJoinWorld,targetWorld=ui.targetWorld,worldLink=ui.worldLink,startFarm=worldStartup.wantsFarm(),antiAFK=ui.antiAFK.enabled})
     end
     local function settingInput(title,control,hint)
         local widget=settingsTab:CreateInput({Name=title,CurrentValue=control.Text,PlaceholderText=hint,RemoveTextAfterFocusLost=false,
@@ -16242,26 +16604,40 @@ return RayfieldLibrary
         table.insert(inputMirrors,{widget=widget,control=control})
     end
     settingsTab:CreateSection("Startup")
-    local worldInput
-    worldInput=settingsTab:CreateInput({Name="Target World",CurrentValue="",PlaceholderText="World name",RemoveTextAfterFocusLost=false,
+    local function updateJoin()
+        worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld,ui.worldLink)
+        ui.Sync(true)
+    end
+    local worldInput=settingsTab:CreateInput({Name="Target World",CurrentValue="",PlaceholderText="KEWELYS or KEWELYS:AWS",RemoveTextAfterFocusLost=false,
         Callback=function(value)
             if ui.updating then return end
-            if busy() then notify("Stop the cycle before changing the target world.");ui.Sync(true);return end
             local name=tostring(value):match("^%s*(.-)%s*$")
-            local normalized=name=="" and "" or worldStartup.worldName(name)
-            if normalized==nil then notify("Enter a valid world name using letters, numbers, underscores, or hyphens.")
-            else ui.targetWorld=normalized;worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld) end
-            ui.Sync(true)
+            local normalized=name=="" and "" or worldStartup.destination(name)
+            if not normalized then notify("Use WORLD or WORLD:ID for Target World, for example KEWELYS:AWS.");ui.Sync(true);return end
+            ui.targetWorld=normalized;updateJoin()
         end})
+    local linkInput=settingsTab:CreateInput({Name="World Link",CurrentValue="",PlaceholderText="CERELO (optional)",RemoveTextAfterFocusLost=false,
+        Callback=function(value)
+            if ui.updating then return end
+            local normalized=normalizeWorldLink(value)
+            if not normalized then notify("Enter a world name such as CERELO for World Link, or leave it blank.");ui.Sync(true);return end
+            ui.worldLink=normalized;updateJoin()
+        end})
+    settingsTab:CreateButton({Name="Join World",Callback=function()
+        if ui.updating then return end
+        local ok,why=worldStartup.joinOnce()
+        if not ok and why then notify(why) end
+        ui.Sync(true);report(true)
+    end})
     local joinToggle=settingsTab:CreateToggle({Name="Auto Join World",CurrentValue=false,Callback=function(value)
         if ui.updating then return end
-        ui.autoJoinWorld=value==true;worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld);ui.Sync(true)
+        ui.autoJoinWorld=value==true;updateJoin()
     end})
     local autoStartToggle=settingsTab:CreateToggle({Name="Auto Start Farm",CurrentValue=false,Callback=function(value)
         if ui.updating then return end
         worldStartup.setFarm(value);ui.Sync(true);report(true)
     end})
-    settingsTab:CreateParagraph({Title="Automatic Startup",Content="Set a target world and enable Auto Join World. Start Farm and Auto Start Farm control the same saved on/off state. Save Config, then keep Auto Load enabled to restore it next run. Farming waits for the target world, character, and server inventory."})
+    settingsTab:CreateParagraph({Title="World Entry",Content="Open the game's world picker and press Join World. GenHub enters World Link first. Leave Target World blank to stop there. To continue, place a door on the same walkable row as the spawn and set its Destination to the target world or exact door, such as KEWELYS:AWS. Enable Auto Join World and save your settings to restore entry with Auto Load."})
     local antiAFKToggle=settingsTab:CreateToggle({Name="Anti AFK",CurrentValue=true,Callback=function(value)
         if ui.updating then return end
         ui.antiAFK.Set(value);ui.Sync(true)
@@ -16347,7 +16723,7 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
-    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, target world, Auto Join World, Start Farm on/off state, Anti AFK, PNB and collection settings, effects, UI size, and Hide Username. Auto Load restores them next run. Turn Start Farm off to cancel farming, including a queued automatic start."})
+    settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, Target World, World Link, Auto Join World, Start Farm on/off state, Anti AFK, PNB and collection settings, effects, UI size, and Hide Username. Auto Load restores them next run. Turn Start Farm off to cancel farming, including a queued automatic start."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
         local b=bind(false)
@@ -16492,6 +16868,7 @@ return RayfieldLibrary
         if autoStartToggle.CurrentValue~=wanted then autoStartToggle:Set(wanted) end
         if joinToggle.CurrentValue~=ui.autoJoinWorld then joinToggle:Set(ui.autoJoinWorld) end
         if worldInput.CurrentValue~=ui.targetWorld then worldInput:Set(ui.targetWorld) end
+        if linkInput.CurrentValue~=ui.worldLink then linkInput:Set(ui.worldLink) end
         if autoLoadToggle.CurrentValue~=ui.autoLoad then autoLoadToggle:Set(ui.autoLoad) end
         for _,item in ipairs(effectMirrors) do if item.widget.CurrentValue~=effects[item.key] then item.widget:Set(effects[item.key]) end end
         for _,item in ipairs(inputMirrors) do if item.widget.CurrentValue~=item.control.Text then item.widget:Set(item.control.Text) end end
@@ -16522,8 +16899,8 @@ return RayfieldLibrary
                     ui.uiScale=valid.uiScale;library:SetUIScale(ui.uiScale)
                     ui.hideUsername=valid.hideUsername;ui.usernamePrivacy.Set(ui.hideUsername)
                     ui.antiAFK.Set(valid.antiAFK)
-                    ui.autoJoinWorld,ui.targetWorld=valid.autoJoinWorld,valid.targetWorld
-                    worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld)
+                    ui.autoJoinWorld,ui.targetWorld,ui.worldLink=valid.autoJoinWorld,valid.targetWorld,valid.worldLink
+                    worldStartup.setJoin(ui.autoJoinWorld,ui.targetWorld,ui.worldLink)
                     ui.configStatus="Saved configuration loaded."
                     worldStartup.setFarm(valid.startFarm,true)
                 else ui.configStatus="Auto Load is disabled. Default settings are in use." end
