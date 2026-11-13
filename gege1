@@ -4483,6 +4483,184 @@ bind(true)
 -- BEGIN PNB RAYFIELD UI
 -- Bundled by tools/build_rayfield_ui.py. Startup restores explicitly saved intent.
 local function installRayfield()
+    local function createNativeGenHub()
+    local library={scale=100}
+    local frameColor=Color3.fromRGB(23,39,42)
+    local controlColor=Color3.fromRGB(35,57,61)
+    local accent=Color3.fromRGB(41,100,105)
+    local textColor=Color3.fromRGB(240,247,247)
+    local function corner(object)
+        create("UICorner",{CornerRadius=UDim.new(0,7)},object)
+    end
+    local function text(parent,class,name,value,size)
+        return create(class,{Name=name,Text=value,Size=size,Font=Enum.Font.Gotham,
+            TextSize=14,TextColor3=textColor,BackgroundTransparency=1,TextTruncate=Enum.TextTruncate.AtEnd},parent)
+    end
+    local function button(parent,name,caption,size,callback)
+        local object=text(parent,"TextButton",name,caption,size)
+        object.BackgroundColor3=controlColor;object.BackgroundTransparency=0
+        corner(object);object.Activated:Connect(callback)
+        return object
+    end
+    local function list(parent,horizontal,gap)
+        return create("UIListLayout",{FillDirection=horizontal and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+            SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,gap)},parent)
+    end
+    local function box(parent,name,value,hint,size)
+        local input=text(parent,"TextBox",name,value,size)
+        input.BackgroundColor3=controlColor;input.BackgroundTransparency=0
+        input.ClearTextOnFocus=false;input.PlaceholderText=hint or ""
+        corner(input)
+        return input
+    end
+    local function group(parent,name)
+        local row=create("Frame",{Name=name,Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+            BackgroundTransparency=1,LayoutOrder=#parent:GetChildren()},parent)
+        list(row,false,5)
+        return row
+    end
+    local function paragraph(parent,name,value,heading)
+        local label=text(parent,"TextLabel",name,value,UDim2.new(1,0,0,0))
+        label.AutomaticSize=Enum.AutomaticSize.Y;label.TextWrapped=true;label.RichText=true
+        label.TextTruncate=Enum.TextTruncate.None;label.TextXAlignment=Enum.TextXAlignment.Left
+        if heading then label.Font=Enum.Font.GothamBold end
+        return label
+    end
+    function library:CreateWindow(settings)
+        local root=create("ScreenGui",{Name="GenHubNative",ResetOnSpawn=false,DisplayOrder=10004},playerGui)
+        self.root=root
+        local shell=create("Frame",{Name="Window",AnchorPoint=Vector2.new(.5,.5),Position=UDim2.new(.5,0,.5,0),
+            Size=UDim2.new(.92,0,.84,0),BackgroundColor3=frameColor,BorderSizePixel=0},root)
+        self.limit=create("UISizeConstraint",{MaxSize=Vector2.new(550,500)},shell)
+        corner(shell)
+        local title=text(shell,"TextLabel","Title",settings.Name,UDim2.new(1,-24,0,38))
+        title.Position=UDim2.fromOffset(12,0);title.TextXAlignment=Enum.TextXAlignment.Left
+        title.Font=Enum.Font.GothamBold
+        local toggle
+        toggle=button(root,"ShowGenHub","Hide",UDim2.fromOffset(64,32),function()
+            shell.Visible=not shell.Visible;toggle.Text=shell.Visible and "Hide" or "GenHub"
+        end)
+        toggle.AnchorPoint=Vector2.new(1,0);toggle.Position=UDim2.new(1,-10,0,8)
+        local strip=create("Frame",{Name="Tabs",Position=UDim2.fromOffset(10,40),Size=UDim2.new(1,-20,0,32),BackgroundTransparency=1},shell)
+        list(strip,true,4)
+        self.notice=text(shell,"TextLabel","Notice","",UDim2.new(1,-20,0,28))
+        self.notice.Position=UDim2.new(0,10,1,-30);self.notice.TextWrapped=true
+        local tabs={}
+        local window={}
+        local function selectTab(current)
+            for _,tab in ipairs(tabs) do
+                tab.page.Visible=tab==current
+                tab.button.BackgroundColor3=tab==current and accent or controlColor
+            end
+        end
+        function window:CreateTab(name)
+            local page=create("ScrollingFrame",{Name=name,Position=UDim2.fromOffset(10,78),Size=UDim2.new(1,-20,1,-112),
+                BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,CanvasSize=UDim2.fromOffset(0,0),
+                AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollingDirection=Enum.ScrollingDirection.Y},shell)
+            create("UIPadding",{PaddingRight=UDim.new(0,7),PaddingBottom=UDim.new(0,6)},page)
+            list(page,false,8)
+            local tab={page=page}
+            tab.button=button(strip,name,name,UDim2.fromOffset(0,32),function() selectTab(tab) end)
+            table.insert(tabs,tab)
+            for _,entry in ipairs(tabs) do entry.button.Size=UDim2.new(1/#tabs,-4,1,0) end
+            selectTab(tabs[1])
+            function tab:CreateSection(title)
+                paragraph(group(page,title),"Heading",title,true)
+            end
+            function tab:CreateParagraph(widget)
+                local row=group(page,widget.Title)
+                local heading=paragraph(row,"Heading",widget.Title,true)
+                local body=paragraph(row,"Body",widget.Content)
+                function widget:Set(value)
+                    heading.Text,body.Text=value.Title,value.Content
+                end
+                return widget
+            end
+            function tab:CreateButton(widget)
+                button(group(page,widget.Name),widget.Name,widget.Name,UDim2.new(1,0,0,38),widget.Callback)
+                return widget
+            end
+            function tab:CreateInput(widget)
+                local row=group(page,widget.Name)
+                paragraph(row,"Heading",widget.Name,true)
+                local input=box(row,widget.Name,widget.CurrentValue,widget.PlaceholderText,UDim2.new(1,0,0,38))
+                function widget:Set(value) self.CurrentValue=value;input.Text=value end
+                input.FocusLost:Connect(function()
+                    widget.CurrentValue=input.Text;widget.Callback(input.Text)
+                end)
+                return widget
+            end
+            function tab:CreateToggle(widget)
+                local control=button(group(page,widget.Name),widget.Name,"",UDim2.new(1,0,0,38),function()
+                    widget:Set(not widget.CurrentValue);widget.Callback(widget.CurrentValue)
+                end)
+                function widget:Set(value)
+                    self.CurrentValue=value
+                    control.Text=self.Name..(value and "   ON" or "   OFF")
+                    control.BackgroundColor3=value and accent or controlColor
+                end
+                widget:Set(widget.CurrentValue)
+                return widget
+            end
+            function tab:CreateSlider(widget)
+                local row=group(page,widget.Name)
+                local heading=paragraph(row,"Value","",true)
+                local actions=create("Frame",{Size=UDim2.new(1,0,0,38),BackgroundTransparency=1,LayoutOrder=1},row)
+                list(actions,true,5)
+                function widget:Set(value)
+                    self.CurrentValue=math.clamp(value,self.Range[1],self.Range[2])
+                    heading.Text=self.Name.."   "..tostring(self.CurrentValue)..(self.Suffix or "")
+                end
+                for _,direction in ipairs({-1,1}) do
+                    local caption=direction<0 and "−" or "+"
+                    button(actions,caption,caption,UDim2.new(.5,-3,1,0),function()
+                        widget:Set(widget.CurrentValue+direction*widget.Increment);widget.Callback(widget.CurrentValue)
+                    end)
+                end
+                widget:Set(widget.CurrentValue)
+                return widget
+            end
+            function tab:CreateDropdown(widget)
+                local row=group(page,widget.Name)
+                paragraph(row,"Heading",widget.Name,true)
+                if widget.SearchCallback then
+                    local input=box(row,"Search","",widget.SearchPlaceholder,UDim2.new(1,0,0,38))
+                    input.LayoutOrder=1
+                    input:GetPropertyChangedSignal("Text"):Connect(function() widget.SearchCallback(input.Text:sub(1,128)) end)
+                end
+                local choices=group(row,"Options");choices.LayoutOrder=3
+                local control=button(row,widget.Name,"",UDim2.new(1,0,0,38),function() choices.Visible=not choices.Visible end)
+                control.LayoutOrder=2;choices.Visible=false
+                function widget:Set(value)
+                    self.CurrentOption=value;control.Text=(value[1] or "Select").."  ▾"
+                end
+                function widget:Refresh(values)
+                    for _,object in ipairs(choices:GetChildren()) do
+                        if object:IsA("TextButton") then object:Destroy() end
+                    end
+                    for index,value in ipairs(values) do
+                        local option=button(choices,"Option",value,UDim2.new(1,0,0,34),function()
+                            choices.Visible=false;self:Set({value});self.Callback(self.CurrentOption)
+                        end)
+                        option.LayoutOrder=index
+                    end
+                end
+                widget:Set(widget.CurrentOption);widget:Refresh(widget.Options)
+                return widget
+            end
+            return tab
+        end
+        return window
+    end
+    function library:SetUIScale(value)
+        self.scale=value;self.limit.MaxSize=Vector2.new(550*value/100,500*value/100)
+    end
+    function library:GetUIScale() return self.scale end
+    function library:Notify(data) self.notice.Text=data.Content end
+    function library:Destroy() if self.root then self.root:Destroy() end end
+    return library
+end
+
     -- The original logo is a separate immutable PNG, cached in the executor workspace.
 local function genhubLogoAsset()
     local custom=type(getcustomasset)=="function" and getcustomasset or type(getsynasset)=="function" and getsynasset
@@ -5547,7 +5725,14 @@ local RayfieldLibrary = {
 -- Interface Management
 
 local RayfieldAssetId = customAssetId or 10804731440
-local Rayfield = useStudio and script.Parent:FindFirstChild('Rayfield') or game:GetObjects("rbxassetid://"..RayfieldAssetId)[1]
+local function loadInterface()
+	if useStudio then return script.Parent:FindFirstChild("Rayfield") end
+	local ok, objects = pcall(function() return game:GetObjects("rbxassetid://"..RayfieldAssetId) end)
+	local model = ok and type(objects) == "table" and objects[1]
+	if typeof(model) == "Instance" and model:IsA("ScreenGui") then return model end
+end
+local Rayfield = loadInterface() or loadInterface()
+if not Rayfield then return nil, "Rayfield model unavailable (asset "..RayfieldAssetId..")." end
 local buildAttempts = 0
 local correctBuild = false
 local warned
@@ -5595,8 +5780,10 @@ repeat
 		warned = true
 	end
 
-	local toDestroy
-	toDestroy, Rayfield = Rayfield, useStudio and script.Parent:FindFirstChild('Rayfield') or game:GetObjects("rbxassetid://"..RayfieldAssetId)[1]
+	local replacement = loadInterface()
+	if not replacement or replacement == Rayfield then break end
+	local toDestroy = Rayfield
+	Rayfield = replacement
 	if toDestroy and not useStudio then toDestroy:Destroy() end
 
 	buildAttempts = buildAttempts + 1
@@ -16414,7 +16601,9 @@ return RayfieldLibrary
     env.DISABLE_RAYFIELD_REQUESTS=true
     local factory,compileError=loadstring(bundledSource,"PNB/Rayfield")
     assert(factory,"Rayfield: "..tostring(compileError))
-    local library=factory()
+    local library,assetError=factory()
+    local nativeUI=library==nil and type(assetError)=="string"
+    if nativeUI then library=createNativeGenHub() end
     assert(type(library)=="table" and type(library.CreateWindow)=="function","Rayfield could not be loaded.")
     local defaultScale=Input.TouchEnabled and 75 or 100
     local ui={library=library,updating=false,ready=false,query="",page=1,pageSize=80,rows={},byId={},options={},
@@ -16561,7 +16750,7 @@ return RayfieldLibrary
         ui.antiAFK.Destroy()
         if type(library.Destroy)=="function" then library:Destroy() end
     end
-    ui.logoAsset=genhubLogoAsset()
+    if not nativeUI then ui.logoAsset=genhubLogoAsset() end
     local window=library:CreateWindow({Name="GenHub 1.9.2",LoadingTitle="GenHub",LoadingSubtitle="Farm Automation",
         LoadingVersion="GenHub 1.9.2",BrandingImage=ui.logoAsset,CommunityInvite="https://discord.gg/jZ4xTfbg5J",
         Theme="Ocean",Icon=0,ToggleUIKeybind=Enum.KeyCode.RightControl,
@@ -16630,7 +16819,7 @@ return RayfieldLibrary
         worldStartup.setFarm(value);ui.Sync(true);report(true)
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
-    main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
+    main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. "..(nativeUI and "Tap Hide to collapse GenHub." or "Right Ctrl toggles the window.")})
     main:CreateButton({Name="Close",Callback=function() dispatch("Close") end})
     local inputMirrors={}
     local function normalizeFilter(text)
@@ -16749,9 +16938,11 @@ return RayfieldLibrary
         ui.hideUsername=value==true;ui.usernamePrivacy.Set(ui.hideUsername)
         ui.Sync(true)
     end})
-    local scaleInfo=settingsTab:CreateParagraph({Title="Window Size",Content="Drag the bottom-right corner to resize the window."})
+    local scaleHelp=nativeUI and "Tap − or + to resize. Save Config remembers your size."
+        or "Drag the bottom-right corner to resize. Save Config remembers your size."
+    local scaleInfo=settingsTab:CreateParagraph({Title="Window Size",Content=scaleHelp})
     local function syncScaleInfo()
-        paragraph(scaleInfo,"Window Size",string.format("Preferred: %.0f%% | On screen: %.0f%%\nDrag the bottom-right corner to resize. Save Config remembers your size.",ui.uiScale,library:GetUIScale()))
+        paragraph(scaleInfo,"Window Size",string.format("Preferred: %.0f%% | On screen: %.0f%%\n%s",ui.uiScale,library:GetUIScale(),scaleHelp))
     end
     local scaleSlider=settingsTab:CreateSlider({Name="UI Scale",Range={50,130},Increment=5,Suffix="%",CurrentValue=ui.uiScale,
         Callback=function(value)
@@ -16761,7 +16952,9 @@ return RayfieldLibrary
             if ui.ready then syncScaleInfo() end
         end})
     settingsTab:CreateButton({Name="Reset UI Layout",Callback=function()
-        ui.uiScale=defaultScale;library:SetUIScale(ui.uiScale);library:ResetUILayout();ui.Sync(true)
+        ui.uiScale=defaultScale;library:SetUIScale(ui.uiScale)
+        if library.ResetUILayout then library:ResetUILayout() end
+        ui.Sync(true)
     end})
     library.OnUIScaleChanged=function(value)
         if not finite(value) then return end
