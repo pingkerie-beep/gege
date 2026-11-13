@@ -16,8 +16,12 @@ local Input = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 assert(player and RunService:IsClient(), "Jalankan pada client setelah masuk world.")
 local playerGui = player:WaitForChild("PlayerGui",15)
-local remotes = RS:WaitForChild("WorldRemotes",15)
-assert(playerGui and remotes, "PlayerGui/WorldRemotes belum tersedia.")
+assert(playerGui, "PlayerGui belum tersedia. Tunggu sampai tampilan game selesai dimuat.")
+-- Newer clients bind through native Net even when the legacy folder is absent.
+local function legacyRemote(name)
+    local folder=RS:FindFirstChild("WorldRemotes")
+    return folder and folder:FindFirstChild(name)
+end
 local env = _G
 if type(getgenv)=="function" then
     local ok,value=pcall(getgenv)
@@ -227,7 +231,7 @@ function compatibility.callbacks(b,name)
     return out
 end
 function compatibility.connect(b,name,fn)
-    local remote=remotes:FindFirstChild(name)
+    local remote=legacyRemote(name)
     if remote and remote:IsA("RemoteEvent") then return remote.OnClientEvent:Connect(fn) end
     local net=b and b.network;local definitions=type(net)=="table" and rawget(net,"EVENTS")
     if type(definitions)~="table" or type(rawget(definitions,name))~="table"
@@ -338,7 +342,7 @@ local function callbacks(name,controller,b)
         local found=compatibility.callbacks(b,name)
         if #found>0 then return found end
     end
-    local remote=remotes:FindFirstChild(name)
+    local remote=legacyRemote(name)
     if not remote or not remote:IsA("RemoteEvent") then return {} end
     local ok,list=pcall(getconnections,remote.OnClientEvent)
     if not ok or type(list)~="table" then return {} end
@@ -965,7 +969,7 @@ local function rpcFor(b,name)
         end
         if name=="DisplayItem" then return function(...) return b.netCall(name,...) end end
     end
-    local remote=remotes:FindFirstChild(name)
+    local remote=legacyRemote(name)
     return remote and remote:IsA("RemoteFunction") and remote or nil
 end
 local function request(p,remote,...)
@@ -2292,6 +2296,24 @@ local function farmPlatformMove(f,m,dt,x,y)
     local elapsed=math.max(0,os.clock()-(m.lastStep or os.clock()));m.lastStep=os.clock()
     local node=m.route[m.index]
     local function failed(reason,returned)
+        local target=f.target
+        local firstUpwardRetry=(returned or reason=="gravity correction meets a block")
+            and node and node.fromKey~=nil
+            and node.y<math.floor(node.fromKey/n.width) and target
+            and (target.kind=="plant" or target.kind=="harvest")
+            and f.upwardRetryTarget~=target.key
+            and math.abs(x-(node.fromKey%n.width+.5))<=.18
+            and math.abs(y-(math.floor(node.fromKey/n.width)+.999))<=.18
+            and farmStanding(n,x,y) and not farmBoxHits(n,x,y)
+        if firstUpwardRetry then
+            f.upwardRetryTarget=target.key
+            f.speed=math.max(2.5,(f.speed or CONFIG.speed)*.8)
+            farmVelocity(n,0)
+            f.motion,f.pathSearch,f.routeRetryAt=nil,nil,nil
+            traceMotion("SUPPORT STEP retry from stable footing: "..reason)
+            farmNote="Retrying the upward step from stable footing."
+            return
+        end
         local count=0
         if returned then
             local previous=f.returnedStep
@@ -2344,6 +2366,11 @@ local function farmPlatformMove(f,m,dt,x,y)
         local transfer=m.transfer
         if not farmStanding(n,gx,gy) or farmBoxHits(n,gx,gy) then
             failed("final support changed during the edge transfer");return
+        end
+        if node.fromKey~=nil and node.y<math.floor(node.fromKey/n.width) and s.grounded==true and standing
+            and math.abs(x-gx)<=.18 and math.abs(y-gy)<=.06 and not farmBoxHits(n,x,y) then
+            m.x,m.y=x,y;m.transfer=nil;m.supportStep={at=os.clock()}
+            return
         end
         if os.clock()-(transfer.progressAt or transfer.at)>3 then failed("clear edge transfer made no progress");return end
         -- Gravity runs before RenderStepped. At low FPS its real displacement
@@ -2518,6 +2545,15 @@ local function farmMove(dt)
     if node and stride>=distance then m.index+=1 end
     farmNote=string.format("Farm menuju %s (%d,%d), rute %d/%d",f.target.kind,f.target.x,f.target.y,math.min(m.index,#m.route),#m.route)
 end
+local function farmActionVisible(f,a)
+    local n=f.native
+    local record=rawget(n.trees,a.y*n.width+a.x)
+    local tile=farmTile(n,a.x,a.y)
+    if a.kind=="plant" then
+        return tile==f.seed and type(record)=="table" and type(rawget(record,"p"))=="number"
+    end
+    return tile==0 and record==nil
+end
 local function farmTick()
     local f=farm
     if not f or pending or f.motion then return end
@@ -2533,7 +2569,11 @@ local function farmTick()
         if a.inventoryReply and not f.job then
             f.job={done=true,reply=a.inventoryReply};a.inventoryReply=nil
         end
-        if not f.job and os.clock()>=(a.nextVerify or 0) and (a.ack or os.clock()-a.at>=(n.b.netCall and .15 or 2)) then
+        local now=os.clock()
+        local age=now-a.at
+        local ready=a.ack or age>=(n.b.netCall and .15 or 2)
+            or n.b.netCall and age>=.06 and (a.kind=="plant" or a.dropAck) and farmActionVisible(f,a)
+        if not f.job and now>=(a.nextVerify or 0) and ready then
             local remote=rpcFor(n.b,"GetInventory")
             if not remote then halt("GetInventory untuk verifikasi farm tidak tersedia.");return end
             f.job=request(f,remote)
@@ -2562,15 +2602,13 @@ local function farmTick()
             local confirmed=a.ack
             if not confirmed and n.b.netCall and a.kind=="plant" and count==a.before-1 then
                 -- Native plant updates the tile locally. The tree record is populated separately by the game.
-                local record=rawget(n.trees,a.y*n.width+a.x)
-                confirmed=type(record)=="table" and type(rawget(record,"p"))=="number"
-                    and farmTile(n,a.x,a.y)==f.seed
+                confirmed=farmActionVisible(f,a)
             end
             if not confirmed and n.b.netCall and a.kind=="harvest" then
                 local blocks=measure(f.job.reply,f.seed-1)
                 local credit=a.dropAck==true or count>a.before
                     or blocks and a.beforeBlocks and blocks>a.beforeBlocks
-                confirmed=credit and rawget(n.trees,a.y*n.width+a.x)==nil and farmTile(n,a.x,a.y)==0
+                confirmed=credit and farmActionVisible(f,a)
             end
             if not confirmed and n.b.netCall and os.clock()-a.at<CONFIG.rpcTimeout then
                 f.job=nil;a.nextVerify=os.clock()+.15;return
@@ -2581,7 +2619,7 @@ local function farmTick()
             log(string.format("FARM %s dikonfirmasi server (%d,%d), Seed ID %d, backpack %d -> %d, %.2fs. %s",
                 a.kind,a.x,a.y,f.seed,a.before,count,os.clock()-a.at,note))
             if f.motionFailures then f.motionFailures[a.y*n.width+a.x]=nil end
-            f.returnedStep=nil;f.recoveryTarget=nil
+            f.returnedStep=nil;f.recoveryTarget=nil;f.upwardRetryTarget=nil
             f.orderCursor=a.y*n.width+a.x
             f.blockedOrder=nil;f.routeRetryAt=nil
             f.job,f.action,f.target=nil,nil,nil;f.scan=nil;f.nextScan=os.clock()
@@ -2655,7 +2693,7 @@ local function farmTick()
         end
         if os.clock()-(f.arrived or 0)<(n.b.netCall and .04 or .2) then return end
         local t=f.target
-        local kind=farmEligible(f,t.x,t.y)
+        local kind,data=farmEligible(f,t.x,t.y)
         if kind~=t.kind then f.target=nil;f.pathSearch=nil;f.blockedOrder=nil;f.routeRetryAt=nil;f.candidates={};return end
         if math.abs(x-(t.x+.5))>.18 or math.abs(y-(t.y+.999))>.18 then
             local route=farmPlan(f,t,x,y)
@@ -2672,8 +2710,6 @@ local function farmTick()
             end
             if guardPNBDrops(n.b,t.x,t.y) then return end
         else
-            local data=farmTreeState(f,t.x,t.y)
-            if data.status~="ready" then f.target=nil;return end
             log(string.format("HARVEST READY (%d,%d) SeedID=%d serverNow=%.3f readyAt=%.3f nativeReady=true",
                 t.x,t.y,f.seed,data.now,data.readyAt))
         end
@@ -2830,7 +2866,7 @@ local function action(place,c,b,lastHit,totalHits)
         if place then playPNBSound(b,"place",c.id) end
         return true,nil,broken
     end
-    local setTile=remotes:FindFirstChild("SetTile")
+    local setTile=legacyRemote("SetTile")
     local byteNet=RS:FindFirstChild("ByteNetReliable")
     if not setTile or not setTile:IsA("RemoteEvent") or not byteNet or not byteNet:IsA("RemoteEvent") then
         return false,"SetTile/ByteNetReliable belum tersedia."
@@ -2912,7 +2948,7 @@ local function displayBinding(b)
     local mayBuild=type(areas)=="table" and rawget(areas,"mayBuild")
     local areaModule=b.gameGui:FindFirstChild("AreaLocks")
     local remote=rpcFor(b,"DisplayItem")
-    local event=remotes:FindFirstChild("DisplayChanged")
+    local event=legacyRemote("DisplayChanged")
     local handler=false
     for _,cb in ipairs(callbacks("DisplayChanged",b.controller)) do
         if ownedArity(cb.fn,b.controller,3) and hasConstants(cb.fn,{"displays","set","syncDisplay"})
@@ -2925,7 +2961,7 @@ local function displayBinding(b)
     -- The v1012 display closure calls state.call and captures its history in slot 4.
     local history=pv and pv[b.netCall and 4 or 5]
     local identity=pv and pv[1]==b.inventory and pv[2]==b.state and type(history)=="table"
-        and (b.netCall or pv[4]==remotes)
+        and (b.netCall or remote and pv[4]==remote.Parent)
     local getValid=module and ownedArity(get,module,2)
     local rpcValid=remote~=nil
     local eventValid=event and event:IsA("RemoteEvent")
@@ -4309,7 +4345,7 @@ compatibility.onBound=function(b)
     local registry=compatibility.registries[b.controller]
     if registry then return end
     registry={};compatibility.registries[b.controller]=registry
-    local named=remotes:FindFirstChild("MoveTo")
+    local named=legacyRemote("MoveTo")
     if named and compatibility.namedEvents then return end
     if named then compatibility.namedEvents=true end
     local moved=compatibility.connect(b,"MoveTo",farmServerMoved)
@@ -4322,8 +4358,8 @@ compatibility.onBound=function(b)
 end
 -- Old versions expose named events before a binding is established.
 if not binding then
-    local b={controller=remotes}
-    compatibility.onBound(b)
+    local folder=RS:FindFirstChild("WorldRemotes")
+    if folder then compatibility.onBound({controller=folder}) end
 end
 connect(RunService.Heartbeat,function()
     if not alive then return end
