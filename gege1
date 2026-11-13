@@ -5732,7 +5732,7 @@ do
 
 			for id, _ in assetFiles do
 				local success, asset = pcall(getcustomasset, AssetPath.."/"..tostring(id)..".png")
-				if success then
+				if success and type(asset) == "string" and asset ~= "" then
 					customAssets[tostring(id)] = asset
 				else
 					warn("Rayfield | Failed to load custom asset: "..tostring(id).." - "..tostring(asset))
@@ -16908,7 +16908,7 @@ return RayfieldLibrary
         local activity=worldStartup.status~="" and worldStartup.status or "Ready to start."
         if not autoLoop and worldStartup.wantsFarm() then stage="Starting" end
         if autoLoop then
-            activity=autoLoop.rejoin and farmNote
+            activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
                 or autoLoop.paused and (autoLoop.paused.status or "Rechecking the character, inventory, and farm position.")
                 or farm and farm.stepRejected and "Movement was returned by the game. Retrying the route automatically after a short pause."
@@ -16933,9 +16933,7 @@ return RayfieldLibrary
             "Game state: "..(binding and "Connected" or "Unavailable").." | Drop sync: "..(binding and binding.setDropCount and "Ready" or "Unavailable"),activity}
         if autoLoop then table.insert(status,"Blocks: "..tostring(autoLoop.blocks or "—").." | Seeds: "..tostring(autoLoop.seeds or "—").." | Storage transfers: "..tostring(autoLoop.deposits or 0)) end
         if autoLoop and autoLoop.rejoin then
-            local recovery=autoLoop.rejoin
-            local destination=recovery.route and (recovery.route.link.." → "..recovery.route.target) or recovery.world
-            table.insert(status,"World Return: "..destination.." | Entry attempts: "..tostring(recovery.attempts))
+            table.insert(status,"World Return: "..autoLoop.rejoin.world.." | Entry attempts: "..tostring(autoLoop.rejoin.attempts or 0))
         end
         local scan=farm and farm.lastScan
         if scan then table.insert(status,string.format("Trees: %d ready | %d growing | %d unknown",scan.ripe or 0,scan.growing or 0,scan.unknown or 0)) end
@@ -17026,7 +17024,14 @@ local uiOk,uiError=pcall(installRayfield)
 if not uiOk then
     if rayfieldUI and rayfieldUI.Destroy then pcall(rayfieldUI.Destroy) end
     rayfieldUI=nil;panel.Visible=true
-    log("Rayfield could not be loaded: "..tostring(uiError):sub(1,240))
+    local message="Rayfield could not be loaded: "..tostring(uiError):sub(1,240)
+    log(message)
+    local notice=create("TextLabel",{Name="RayfieldInitError",Text=message,TextWrapped=true,
+        AnchorPoint=Vector2.new(.5,0),Position=UDim2.new(.5,0,0,52),Size=UDim2.new(.9,0,0,76),
+        BackgroundColor3=Color3.fromRGB(40,30,34),BorderSizePixel=0,
+        TextColor3=Color3.fromRGB(255,231,230),TextSize=13,Font=Enum.Font.Code,ZIndex=2},gui)
+    create("UISizeConstraint",{MaxSize=Vector2.new(540,76)},notice)
+    create("UICorner",{CornerRadius=UDim.new(0,8)},notice)
 end
 report(true)
 print("[GenHub 1.9.2] Choose a Farmable Target. Toggle Start Farm on to begin or off to stop.")
