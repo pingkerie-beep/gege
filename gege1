@@ -3668,12 +3668,15 @@ do
         if not a or a.rejoin or not name(a.pinnedWorld or a.world) then return end
         local b=a.native and a.native.b or binding
         local target=name(a.pinnedWorld or a.world)
-        halt("World menu opened; returning to "..target..".")
-        a.rejoin={world=target,binding=b,nextAt=os.clock()+1,attempts=0}
+        local route=a.linkRoute
+        if route and route.world~=target then route=nil end
+        local destination=route and (route.target.." via "..route.link) or target
+        halt("World menu opened; returning to "..destination..".")
+        a.rejoin={world=target,binding=b,route=route,nextAt=os.clock()+1,attempts=0}
         binding=nil
         if a.paused then a.paused.session=false;a.paused.job=nil end
-        farmNote="Returning to "..target..". Waiting for the world menu."
-        traceMotion("WORLD RETURN queued "..target)
+        farmNote="Returning to "..destination..". Waiting for the world menu."
+        traceMotion("WORLD RETURN queued "..destination)
     end
     function worldReturn.tick()
         local a=autoLoop
@@ -3682,8 +3685,8 @@ do
         local current=b and name(rawget(b.state,"name"))
         local pinned=name(a.pinnedWorld or a.world)
         local r=a.rejoin
-        local shown=menuVisible(r and r.binding or b)
         if not r then
+            local shown=menuVisible(b)
             if pinned and current==pinned then a.nativeWorldSeen=true end
             if shown==true and pinned and a.nativeWorldSeen then
                 worldReturn.begin()
@@ -3704,6 +3707,14 @@ do
                 if os.clock()-a.menuSince>=1 then worldReturn.begin();return true end
             else a.menuSince=nil end
             return false
+        end
+        local shown
+        if r.route then
+            local waiting,visible,live=worldStartup.tickLinkReturn(r)
+            if waiting then return true end
+            shown,r.binding=visible,live
+        else
+            shown=menuVisible(r.binding)
         end
         -- Never pull the player out of a different world they have entered.
         local known=r.binding and r.binding.state
@@ -3747,6 +3758,10 @@ do
             end
         end
         r.stableAt=nil
+        if r.route then
+            farmNote="Waiting for the character at "..r.route.target.."."
+            return true
+        end
         if not r.observedMenu then
             farmNote="Returning to "..r.world..". Waiting for the current world to close.";return true
         end
@@ -3797,6 +3812,12 @@ function worldStartup.destination(value)
     if not world or door and (door:find("%c") or not door:find("%S")) then return nil end
     return door and (world..":"..door) or world,world,door
 end
+function worldStartup.farmLinkRoute()
+    local target,world,door=worldStartup.destination(worldStartup.targetWorld)
+    local link=worldStartup.worldName(worldStartup.worldLink)
+    if not world or not link or link==world then return nil end
+    return {target=target,world=world,door=door,link=link}
+end
 function worldStartup.cancelFarm()
     if worldStartup.stopLink then worldStartup.stopLink() end
     worldStartup.farmWanted=false;worldStartup.manualStart=false
@@ -3823,7 +3844,7 @@ function worldStartup.setJoin(enabled,world,link)
     local target=worldStartup.destination(world) or ""
     link=worldStartup.worldName(link) or ""
     if target~=worldStartup.targetWorld or link~=(worldStartup.worldLink or "") then
-        if worldStartup.stopLink then worldStartup.stopLink() end
+        if worldStartup.stopLink and not (autoLoop and autoLoop.rejoin) then worldStartup.stopLink() end
         worldStartup.linkTried=nil
         worldStartup.enteredDoor=nil;worldStartup.checkDoor=nil;worldStartup.nextDoorCheck=nil
         worldStartup.joinStatus=nil;worldStartup.attempts=0
@@ -4011,6 +4032,7 @@ do
         s.checkDoor=nil;s.nextDoorCheck=nil
         s.stableAt=nil;s.stableWorld=nil
         s.status="Joining World Link "..link.."."
+        return s.linkTrip
     end
     function s.tickLink(b,shown,enter,x,y,world)
         local trip=s.linkTrip
@@ -4040,6 +4062,7 @@ do
             local verifiedLink=trip.exact and not main and not (record and rawget(record,"id"))
                 and tile~=6 and type(item)=="table" and rawget(item,"door")==true
             if not trip.door or matched or verifiedLink then
+                trip.arrived=true
                 s.stopLink()
                 s.linkTried=nil
                 s.enteredDoor=trip.target
@@ -4110,6 +4133,47 @@ do
         walk(trip,key,x,now)
         return true
     end
+end
+function worldStartup.tickLinkReturn(r)
+    local s=worldStartup
+    local route=r.route
+    local b=bind(false)
+    local context=s.menuBinding(b or compatibility.context(r.binding) and r.binding)
+    local shown,enter=worldReturn.surface(context)
+    local now=os.clock()
+    if shown==true then
+        r.observedMenu=true;r.surfaceObserved=true
+        if r.linkArrived then
+            r.linkArrived=nil;r.stableAt=nil;r.nextAt=now+1
+        end
+    end
+    if r.linkArrived then return false,shown,b end
+
+    local x,y,world=livePosition(b)
+    if r.trip then
+        if s.linkTrip==r.trip then s.tickLink(b,shown,enter,x,y,world) end
+        if s.status~="" then farmNote=s.status end
+        if s.linkTrip==r.trip then return true end
+        local arrived=r.trip.arrived
+        r.trip=nil
+        if arrived then
+            r.linkArrived=true
+            return false,shown,b
+        end
+        r.nextAt=now+math.min(30,3*2^math.min(4,r.attempts-1))
+        return true
+    end
+    if now<r.nextAt or (lease.outstanding or 0)>0 or Input:GetFocusedTextBox() then return true end
+    if (shown==true and enter) or (shown==false and world==route.link and r.observedMenu) then
+        r.attempts+=1
+        r.trip=s.beginLink(route.target,route.world,route.door,route.link)
+        farmNote=s.status
+    elseif shown==false and world and world~=route.link then
+        farmNote="Open the world picker to return to "..route.target.." via "..route.link.."."
+    else
+        farmNote="Returning via "..route.link..". Waiting for the world picker."
+    end
+    return true
 end
 function worldStartup.joinOnce()
     local s=worldStartup
@@ -4259,6 +4323,7 @@ onAction(loopButton,function()
         log("Isi Item ID blok, Pukul 1-50, Jeda 0.05-5 detik.");report(true);return
     end
     local a={block=id,seed=id+1,hits=hits,interval=interval,stage="JEDA",nextCheck=0,deposits=0,prepare=true,
+        linkRoute=worldStartup.farmLinkRoute(),
         progressAt=os.clock(),paused={reason="Mulai",retryAt=0,at=os.clock()}}
     autoLoop=a;seedInput.Text=tostring(a.seed);loopButton.Text="Siklus otomatis: ON"
     recoverLoop()
@@ -16843,7 +16908,7 @@ return RayfieldLibrary
         local activity=worldStartup.status~="" and worldStartup.status or "Ready to start."
         if not autoLoop and worldStartup.wantsFarm() then stage="Starting" end
         if autoLoop then
-            activity=autoLoop.rejoin and ("Returning to "..autoLoop.rejoin.world..". Farming resumes after the world and inventory are ready.")
+            activity=autoLoop.rejoin and farmNote
                 or autoLoop.waitingWorld and ("Waiting for farm world "..tostring(autoLoop.pinnedWorld)..". No actions run in another world.")
                 or autoLoop.paused and (autoLoop.paused.status or "Rechecking the character, inventory, and farm position.")
                 or farm and farm.stepRejected and "Movement was returned by the game. Retrying the route automatically after a short pause."
@@ -16868,7 +16933,9 @@ return RayfieldLibrary
             "Game state: "..(binding and "Connected" or "Unavailable").." | Drop sync: "..(binding and binding.setDropCount and "Ready" or "Unavailable"),activity}
         if autoLoop then table.insert(status,"Blocks: "..tostring(autoLoop.blocks or "—").." | Seeds: "..tostring(autoLoop.seeds or "—").." | Storage transfers: "..tostring(autoLoop.deposits or 0)) end
         if autoLoop and autoLoop.rejoin then
-            table.insert(status,"World Return: "..autoLoop.rejoin.world.." | Entry attempts: "..tostring(autoLoop.rejoin.attempts or 0))
+            local recovery=autoLoop.rejoin
+            local destination=recovery.route and (recovery.route.link.." → "..recovery.route.target) or recovery.world
+            table.insert(status,"World Return: "..destination.." | Entry attempts: "..tostring(recovery.attempts))
         end
         local scan=farm and farm.lastScan
         if scan then table.insert(status,string.format("Trees: %d ready | %d growing | %d unknown",scan.ripe or 0,scan.growing or 0,scan.unknown or 0)) end
