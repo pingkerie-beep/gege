@@ -12,7 +12,7 @@ do
         headless=true,                              -- true  = tanpa GUI (hanya layar hitam + status)
                                                     -- false = GUI Rayfield ditampilkan lagi
         overlay={
-            transparency=0.08,                      -- kegelapan layar status: 0 = hitam pekat, 1 = bening
+            transparency=0.1,                      -- kegelapan layar status: 0 = hitam pekat, 1 = bening
             textSize=18,                            -- ukuran MAKSIMAL tulisan status; kalau teks panjang otomatis mengecil agar semua muat
         },
         users=source.users,                         -- config per username, diisi dari getgenv().GENHUB_GROWBLOX
@@ -24,8 +24,9 @@ end;
 -- PNB/collect remain stationary; Auto Farm uses the existing native movement route.
 local CONFIG = { range=3, interval=0.06, retrySeconds=5, rpcTimeout=5, scanLimit=20000,
     batchLimit=256, parallel=4, waveGap=.08, settleSeconds=.12,
-    speed=5, frameLimit=.05, sendInterval=1/15, timeout=180, maxReplans=20,
-    pathNodeLimit=30000,pathTimeLimit=.25 }
+    speed=7, frameLimit=.05, sendInterval=1/15, timeout=180, maxReplans=20,
+    pathNodeLimit=30000,pathTimeLimit=.25,
+    flow=true,flowBatch=8,airSkip=true,airSkipMax=5 } -- PATCH FLOW: flow=false mengembalikan perilaku lama (verifikasi per tile); speed=5 = setelan khas kaitun
 CONFIG.taken={} -- PATCH: uid -> {id,orig,taken}. Drop yang sudah DITERIMA server tidak boleh dihitung/diminta lagi.
 CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
 local Players = game:GetService("Players")
@@ -183,10 +184,53 @@ local function read(o,k)
     if ok then return value end
     return nil
 end
+local liveS=nil -- PATCH v1930: tabel lokal renderer baru (px,py,world,view,...)
+local liveFns=nil
+local function isLiveFn(fn) -- PATCH v1930: fungsi milik tabel S / S.world dianggap milik script game
+    if not liveS or type(fn)~="function" then return false end
+    if not liveFns then
+        liveFns=setmetatable({},{__mode="k"})
+        for _,t in ipairs({liveS,liveS.world}) do
+            for _,v in pairs(t) do if type(v)=="function" then liveFns[v]=true end end
+        end
+    end
+    return liveFns[fn]==true
+end
 local function upvalues(fn)
     if type(fn)~="function" then return nil end
     local ok,values=pcall(debug.getupvalues,fn)
-    return ok and type(values)=="table" and values or nil
+    if not (ok and type(values)=="table") then return nil end
+    -- PATCH v1930: game v1930 memindahkan semua local renderer ke satu tabel (upvalue ke-1).
+    -- Susun ulang jadi layout lama supaya pembacaan world/posisi/kamera tetap jalan.
+    local S=rawget(values,1)
+    if type(S)=="table" and type(rawget(S,"world"))=="table" and type(rawget(S,"px"))=="number" and type(rawget(S,"view"))=="userdata" then
+        local okc,cs=pcall(debug.getconstants,fn)
+        local isRenderer=false
+        if okc and type(cs)=="table" then for _,v in pairs(cs) do if v=="punchFresh" then isRenderer=true break end end end
+        if isRenderer then
+            if liveS~=S then liveFns=nil end
+            liveS=S
+            return {S.world,nil,nil,S.view,nil,S.worldFrame,[20]=S.px,[21]=S.py,[25]=false,[30]=S.act,[37]=S.hp}
+        end
+    end
+    if liveS then
+        local W=liveS.world
+        if fn==rawget(W,"goTo") then return {liveS.px,liveS.py,W} end
+        -- PATCH v1930 (dump): semua fungsi game kini hanya punya upvalue S; susun ulang layout lama per fungsi.
+        if fn==rawget(W,"backpackNow") then return {liveS.inv} end
+        if fn==rawget(W,"dropTaken") then return {liveS.drops,W,liveS.setDropCount} end
+        if fn==liveS.setDropCount then return {liveS.drops} end
+        if fn==rawget(W,"dropOk") then return {nil,nil,nil,nil,nil,liveS.Items} end
+        if fn==rawget(W,"enter") then return {liveS.others,nil,nil,nil,liveS.others} end
+        if fn==liveS.act then return {[6]=W,[11]=liveS.Sfx,[13]=liveS.Items,[21]=0,[23]=liveS.particles,[40]=liveS.canPlace,[41]=liveS.plantSeed,[42]=liveS.hit} end
+        if fn==liveS.canPlace then return {W,liveS,nil,nil,liveS.Items} end
+        if fn==liveS.plantSeed then return {liveS.setTile,liveS.inv,[12]=liveS.Sfx} end
+        if fn==liveS.hit then return {W,nil,liveS.Sfx,liveS.treeRipe,liveS.setTile,liveS.MATERIAL_SFX,liveS.particles,liveS.trees,liveS.Items} end
+        if fn==liveS.treeRipe then return {liveS.Items} end
+        -- fungsi lain yang hanya menangkap S: di layout lama upvalue pertamanya adalah state (S.world)
+        if rawequal(values[1],liveS) and next(values,1)==nil then return {W} end
+    end
+    return values
 end
 local function captures(values,target)
     for _,value in pairs(values or {}) do if value==target then return true end end
@@ -195,7 +239,8 @@ end
 local compatibility={aliases={},registries={},events={}}
 local function ownerMatches(fn,owner)
     local ok,scope=pcall(getfenv,fn)
-    return ok and type(scope)=="table" and (scope.script==owner or compatibility.aliases[owner]~=nil and compatibility.aliases[owner]==scope.script)
+    if ok and type(scope)=="table" and (scope.script==owner or compatibility.aliases[owner]~=nil and compatibility.aliases[owner]==scope.script) then return true end
+    return liveS~=nil -- PATCH v1930: tiap fungsi game punya script acak berbeda; arity/konstanta/identitas tetap diperiksa
 end
 local function ownedArity(fn,owner,arity)
     if type(fn)~="function" or not ownerMatches(fn,owner) then return false end
@@ -228,18 +273,30 @@ function compatibility.alias(fn,template,markers,arity)
 end
 function compatibility.others(b)
     if b.others then return b.others end
+    local notes={};compatibility.othersNotes=notes
+    local function note(m) table.insert(notes,"others: "..m) end
     local template0=b.gameGui and b.gameGui:FindFirstChild("Others")
-    for _,value in pairs(upvalues(rawget(b.state,"enter")) or {}) do
+    local enterUp=upvalues(rawget(b.state,"enter")) or {}
+    local tried=0
+    for _,value in pairs(enterUp) do
         if type(value)=="table" then
+            tried+=1
             local update,sendHit=rawget(value,"update"),rawget(value,"sendHit")
             local template=template0 or functionOwner(update)
-            if compatibility.alias(update,template,{"seen","group","nameBox"},4)
-                and ownedArity(sendHit,template,2) and hasConstants(sendHit,{"act","send","kind"}) then
+            note("kandidat update="..typeof(update).." sendHit="..typeof(sendHit).." template="..typeof(template))
+            local okAlias=compatibility.alias(update,template,{"seen","group","nameBox"},4)
+            local okHit=ownedArity(sendHit,template,2) and hasConstants(sendHit,{"act","send","kind"})
+            note("alias(update)="..tostring(okAlias).." sendHit="..tostring(okHit))
+            if okAlias and okHit then
                 local uv=upvalues(update);local sender=uv and uv[1]
-                if ownedArity(sender,template,1) and hasConstants(sender,{"state","move","send","flags"}) then
+                local okSender=ownedArity(sender,template,1) and hasConstants(sender,{"state","move","send","flags"})
+                note("sender="..tostring(okSender).." (up1="..typeof(sender)..")")
+                if okSender then
                     local sv=upvalues(sender);local config=sv and sv[1]
                     local getter=type(config)=="table" and rawget(config,"state")
                     local gv=ownedArity(getter,b.controller,0) and upvalues(getter)
+                    note("getter="..typeof(getter).." gv1==state="..tostring(gv and gv[1]==b.state)
+                        .." consts="..tostring(type(getter)=="function" and hasConstants(getter,{"active","x","y","vx","vy","dead"})))
                     if gv and gv[1]==b.state and hasConstants(getter,{"active","x","y","vx","vy","dead"}) then
                         b.others,b.stateGetter,b.network=value,getter,sv[5]
                         return value
@@ -248,6 +305,7 @@ function compatibility.others(b)
             end
         end
     end
+    if tried==0 then note("tidak ada tabel di upvalue enter") end
 end
 function compatibility.exportRuntime(b)
     if type(getscriptbytecode)~="function" or type(writefile)~="function" then return end
@@ -275,7 +333,7 @@ function compatibility.renderer(gui)
             local rv=upvalues(fn);local st=rv and rv[1];local gf=type(st)=="table" and rawget(st,"goTo")
             local gv=upvalues(gf)
             compatibility.lastProbe="owner="..(typeof(owner)=="Instance" and owner.ClassName or typeof(owner))
-                .." renderer="..tostring(ownedArity(fn,owner,1)).." goTo="..tostring(ownedArity(gf,owner,2))
+                .." renderer="..tostring(ownedArity(fn,owner,1)).." goTo="..tostring(ownedArity(gf,owner,2)).."("..(type(gf)=="function" and (function() local a,b,c=pcall(debug.info,gf,"a");return tostring(b).."/"..tostring(c) end)() or "nil")..")"
                 .." markers="..tostring(type(gf)=="function" and hasConstants(gf,{"Vector2","new","deadAt"}))
                 .." state="..tostring(gv and gv[3]==st).." camera="..tostring(rv and typeof(rv[4]))
                 .." world="..tostring(rv and typeof(rv[6]))
@@ -285,7 +343,9 @@ function compatibility.renderer(gui)
             and ownedArity(fn,owner,1) and hasConstants(fn,{"punchFresh","punchPressed","GetServerTimeNow"}) then
             local uv=upvalues(fn);local state=uv and uv[1];local camera,world=uv and uv[4],uv and uv[6]
             local goTo=type(state)=="table" and rawget(state,"goTo")
-            local gv=ownedArity(goTo,owner,2) and upvalues(goTo)
+            -- PATCH v1930: arity goTo berubah (bukan 2 lagi); cukup pastikan milik script yang sama.
+            local gv=type(goTo)=="function" and upvalues(goTo) -- PATCH v1930: owner goTo tidak lagi cocok dengan renderer
+            if type(goTo)=="function" then local oka,na,va=pcall(debug.info,goTo,"a");compatibility.goToInfo=tostring(oka and na).."/"..tostring(va) end
             if typeof(camera)=="Instance" and camera:IsA("Frame") and typeof(world)=="Instance"
                 and world.Parent==gui and camera.Parent==world and camera:IsDescendantOf(playerGui)
                 and hasConstants(goTo,{"Vector2","new","deadAt"}) and gv and gv[3]==state
@@ -441,7 +501,13 @@ end
 local function positionSnapshot(b)
     local x,y,world,hp=debugPosition()
     if x then return x,y,world,hp end
-    return nativePosition(b or binding)
+    local nx,ny,nworld,nhp=nativePosition(b or binding)
+    if nx then return nx,ny,nworld,nhp end
+    -- PATCH v1930: tampilkan world/posisi langsung dari tabel renderer meski bind() belum lengkap.
+    if liveS and type(liveS.world)=="table" and type(liveS.world.name)=="string" and finite(liveS.px) and finite(liveS.py) then
+        return liveS.px,liveS.py,liveS.world.name,liveS.hp
+    end
+    return nil
 end
 local function callbacks(name,controller,b)
     b=b or (compatibility.active and compatibility.active.controller==controller and compatibility.active)
@@ -542,7 +608,7 @@ local function bind(force)
             end
         end
     end
-    if #lists==0 and b.network then
+    if #lists==0 and (b.network or liveS) then -- PATCH v1930: jalur langsung dropTaken tanpa network
         local taken=rawget(b.state,"dropTaken")
         local tv=ownedArity(taken,controller,2) and upvalues(taken)
         if tv and tv[2]==b.state and type(tv[1])=="table"
@@ -705,6 +771,7 @@ local function bind(force)
         local cand=ov and ov[6]
         if type(cand)=="table" and type(rawget(cand,1))=="table" and rawget(rawget(cand,1),"name")~=nil then b.itemDB=cand end
     end
+    if not b.itemDB and liveS and type(liveS.Items)=="table" then b.itemDB=liveS.Items end -- PATCH v1930
     local shared=RS:FindFirstChild("Shared")
     local module=shared and shared:FindFirstChild("Inventory")
     local getter=rawget(b.state,"backpackNow")
@@ -1896,7 +1963,7 @@ local function farmBinding(b)
     local canPlace,plant,hit=nil,nil,nil
     local values=upvalues(act)
     for _,fn in pairs(values or {}) do
-        if ownedArity(fn,controller,3) and hasConstants(fn,{"buildRange","seed","platform","canEdit"}) then canPlace=fn end
+        if ownedArity(fn,controller,3) and hasConstants(fn,{"seed","platform","canEdit"}) then canPlace=fn end
         if ownedArity(fn,controller,3) and hasConstants(fn,{"tree_plant","remove","from","to"}) then plant=fn end
         if ownedArity(fn,controller,4) and hasConstants(fn,{"tree_harvest","staffHits","punchLocked"}) then hit=fn end
     end
@@ -2065,6 +2132,7 @@ local function farmBinding(b)
     local update=type(others)=="table" and rawget(others,"update")
     local sendHit=type(others)=="table" and rawget(others,"sendHit")
     if not module then module=functionOwner(update) end
+    for _,line in ipairs(compatibility.othersNotes or {}) do save(line) end
     save("others="..typeof(others).." update="..functionDescription(update).." sendHit="..functionDescription(sendHit))
     if not module or not ownedArity(update,module,4) or not ownedArity(sendHit,module,2)
         or not hasConstants(update,{"seen","group","nameBox"}) or not hasConstants(sendHit,{"act","send","kind"}) then
@@ -2086,7 +2154,7 @@ local function farmBinding(b)
     local packet=rawget(net,"move");local send=type(packet)=="table" and rawget(packet,"send")
     local width,height=rawget(b.state,"w"),rawget(b.state,"h")
     if not ownedArity(getter,controller,0) or not hasConstants(getter,{"active","x","y","vx","vy","dead"})
-        or not ownedArity(solid,controller,2) or not hasConstants(solid,{"w","h","fg","solid"})
+        or not ownedArity(solid,controller,2) or not hasConstants(solid,{"w","h","solid"})
         or type(send)~="function" or not integer(width) or not integer(height) or width<1 or height<2
         or width*height>65536 or type(rawget(b.state,"fg"))~="table" then return nil,"Grid/getter/collision farm belum cocok." end
     save("treeRipe "..functionDescription(ripe));save("TreeChanged "..functionDescription(treeHandler));save("movement OK")
@@ -2096,6 +2164,12 @@ local function farmBinding(b)
     if not ownedArity(rangeFn,controller,0) then rangeFn=nil end
     local buildRange=type(api)=="table" and rawget(api,"buildRange")
     if not ownedArity(buildRange,controller,0) then buildRange=nil end
+    if not buildRange and liveS then -- PATCH v1930: buildRange/punchRange tidak lagi ada sebagai fungsi; pakai konstanta jangkauan game (konservatif)
+        local reach=math.min(tonumber(liveS.RANGE) or 2.5,tonumber(liveS.MAX_REACH) or 2.5)
+        buildRange=function() return reach end
+        if not rangeFn then rangeFn=buildRange end
+        save("buildRange sintetis="..tostring(reach))
+    end
     local boxHits
     for _,fn in pairs(rendered or {}) do
         if ownedArity(fn,controller,2) and hasConstants(fn,{"0.95","0.3","0.0001","floor"}) then
@@ -3024,6 +3098,33 @@ local function farmMove(dt)
         if f.motionFailures then f.motionFailures[f.target.key]=nil end
         f.motion=nil;f.arrived=os.clock();farmNote="Sampai lahan; memeriksa kembali sebelum aksi.";return
     end
+    -- PATCH AIRSKIP: jangan melayang melewati tile kosong (naik/menyeberang celah). Bila node berikutnya
+    -- tidak punya pijakan, langsung pindah ke node berpijak berikutnya di rute yang sama (hanya naik/datar).
+    if CONFIG.airSkip and node and not n.glide and os.clock()>=(f.noSkipUntil or 0) then
+        local function stand(nd) return farmStanding(n,nd.x+.5,nd.y+.999) end
+        if not stand(node) and farmStanding(n,x,y) then
+            local j=m.index
+            while m.route[j] and not stand(m.route[j]) do j+=1 end
+            local tgt=m.route[j]
+            local curRow=math.floor(y-.12)
+            local maxSkip=CONFIG.airSkipMax or 5
+            if tgt and j-m.index<maxSkip and tgt.y<=curRow and curRow-tgt.y<=maxSkip and math.abs(tgt.x+.5-x)<=maxSkip then
+                local tx,ty=tgt.x+.5,tgt.y+.999
+                if not farmBoxHits(n,tx,ty) then
+                    local movedSkip,errSkip=farmWritePosition(n,tx,ty)
+                    if not movedSkip then halt("Gerak farm gagal: "..tostring(errSkip));return end
+                    if farm~=f or f.motion~=m or f.correction then return end
+                    m.x,m.y=tx,ty;f.lastSkipAt=os.clock()
+                    traceMotion(string.format("AIR SKIP %.2f,%.2f -> %.2f,%.2f (%d node udara dilewati)",x,y,tx,ty,j-m.index))
+                    local sentSkip,whySkip=farmPublish(f,m)
+                    if not sentSkip then halt(whySkip);return end
+                    if farm~=f or f.motion~=m or f.correction then return end
+                    m.index=j+1
+                    return
+                end
+            end
+        end
+    end
     local gx,gy=node and node.x+.5 or m.destX,node and node.y+.999 or m.destY
     local dx,dy=gx-m.x,gy-m.y;local distance=math.sqrt(dx*dx+dy*dy)
     if distance<.00001 then if node then m.index+=1 end;return end
@@ -3031,8 +3132,12 @@ local function farmMove(dt)
     if stride<=0 then return end
     local nx,ny=m.x+dx/distance*stride,m.y+dy/distance*stride
     local ok,blocked=pcall(function()
+        -- PATCH SAG: gravitasi menurunkan posisi aktual .01-.06 dari titik rute di antara frame.
+        -- Jangan hitung sag itu sebagai tabrakan; mulai cek dari titik rute.
+        local sx,sy=x,y
+        if y>m.y and y-m.y<=.12 then sy=m.y end
         for i=1,5 do
-            local cx,cy=x+(nx-x)*i/5,y+(ny-y)*i/5
+            local cx,cy=sx+(nx-sx)*i/5,sy+(ny-sy)*i/5
             if farmBoxHits(n,cx,cy) then return true end
         end
         return false
@@ -3076,7 +3181,7 @@ local function farmTick()
         if a.inventoryReply and not f.job then
             f.job={done=true,reply=a.inventoryReply};a.inventoryReply=nil
         end
-        if not f.job and os.clock()>=(a.nextVerify or 0) and (a.ack or os.clock()-a.at>=(n.b.netCall and .15 or 2)) then
+        if not f.job and os.clock()>=(a.nextVerify or 0) and (a.ack or os.clock()-a.at>=(n.b.netCall and .06 or 2)) then
             local remote=rpcFor(n.b,"GetInventory")
             if not remote then halt("GetInventory untuk verifikasi farm tidak tersedia.");return end
             f.job=request(f,remote)
@@ -3102,8 +3207,8 @@ local function farmTick()
                 end
                 halt("Inventory farm belum terverifikasi: "..tostring(note));return
             end
-            local confirmed=a.ack
-            if not confirmed and n.b.netCall and a.kind=="plant" and count==a.before-1 then
+            local confirmed=a.ack and not a.batch -- PATCH FLOW: ack satu tile bukan bukti satu batch
+            if not confirmed and n.b.netCall and a.kind=="plant" and count==a.before-(a.batch or 1) then
                 -- Native plant updates the tile locally. The tree record is populated separately by the game.
                 refreshTrees(n)
                 local record=rawget(n.trees,a.y*n.width+a.x)
@@ -3117,7 +3222,14 @@ local function farmTick()
                 confirmed=credit and rawget(n.trees,a.y*n.width+a.x)==nil and farmTile(n,a.x,a.y)==0
             end
             if not confirmed and n.b.netCall and os.clock()-a.at<CONFIG.rpcTimeout then
-                f.job=nil;a.nextVerify=os.clock()+.15;return
+                f.job=nil;a.nextVerify=os.clock()+.06;return
+            end
+            local doneCount=a.batch or 1
+            if not confirmed and a.batch and count<a.before and (f.partialFlow or 0)<5 then
+                -- PATCH FLOW: sebagian tanam ditolak server; terima yang masuk, pindai ulang sisanya.
+                f.partialFlow=(f.partialFlow or 0)+1
+                doneCount=a.before-count;confirmed=true;a.partial=true
+                log(string.format("FLOW: %d dari %d tanam diterima server; sisanya dipindai ulang.",doneCount,a.batch))
             end
             if not confirmed then
                 -- PATCH Harvest: pohon terkunci (tidak bisa dipanen) -> lewati koordinatnya, jangan stop.
@@ -3136,16 +3248,17 @@ local function farmTick()
                 halt("Aksi "..a.kind.." belum dikonfirmasi server; farm dihentikan.");return
             end
             if not cacheLoopSnapshot(f.job.reply) then halt("Stok siklus dari verifikasi pohon belum valid.");return end
-            if a.kind=="plant" then f.planted+=1 else f.harvested+=1 end
+            if a.kind=="plant" then f.planted+=doneCount else f.harvested+=1 end
             log(string.format("FARM %s dikonfirmasi server (%d,%d), Seed ID %d, backpack %d -> %d, %.2fs. %s",
                 a.kind,a.x,a.y,f.seed,a.before,count,os.clock()-a.at,note))
             if f.motionFailures then f.motionFailures[a.y*n.width+a.x]=nil end
             if f.skipped then f.skipped[a.y*n.width+a.x]=nil end
-            f.orderCursor=a.y*n.width+a.x
+            f.orderCursor=a.y*n.width+a.x;if a.partial then f.orderCursor=nil end
             f.blockedOrder=nil;f.routeRetryAt=nil
             f.job,f.action,f.target=nil,nil,nil;f.scan=nil;f.nextScan=os.clock()
             f.lastScan=nil
-            f.resumeAt=os.clock()+(n.b.netCall and .03 or .35);nextCollect=0
+            -- PATCH speed: jeda minimum antar aksi = kecepatan native game (BUILD_EVERY .15 / PUNCH_EVERY .22)
+            f.resumeAt=math.max(os.clock()+(n.b.netCall and .03 or .35),a.at+(a.kind=="harvest" and .22 or .15));nextCollect=0
         end
         return
     end
@@ -3184,12 +3297,28 @@ local function farmTick()
         farmNote="Waiting for a block or platform beneath the character before selecting a route."
         return
     end
+    -- PATCH FLOW: verifikasi inventory per batch (bukan per tile) supaya jalan tidak berhenti menunggu server.
+    -- Flush hanya saat belum ada target terpilih, supaya target yang sudah dipop dari antrean tidak hilang.
+    if f.flow and #f.flow.list>0 and not f.target then
+        local flow=f.flow
+        local idle=#(f.candidates or {})==0
+        if idle or #flow.list>=math.min(CONFIG.flowBatch or 8,math.max(1,flow.base or 1)) or os.clock()-flow.list[1].at>1.5 then
+            local last=flow.list[#flow.list]
+            f.action={kind="plant",x=last.x,y=last.y,at=os.clock(),before=flow.base,batch=#flow.list,
+                beforeBlocks=inventoryNumber(n.b,"count",f.seed-1),ack=false}
+            farmNote=string.format("Memverifikasi %d tanam ke server.",#flow.list)
+            flow.list={};flow.base=nil
+            return
+        end
+    end
     if f.target then
         if f.routeRetryAt and os.clock()<f.routeRetryAt then
             farmNote=string.format("Waiting to reach the first eligible tile (%d,%d); later tiles stay queued.",f.target.x,f.target.y)
             return
         end
-        if os.clock()-(f.arrived or 0)<(n.b.netCall and .04 or .2) then return end
+        if os.clock()-(f.arrived or 0)<(n.b.netCall and (CONFIG.flow and .01 or .04) or .2) then return end
+        -- PATCH FLOW: sudah sampai di tile berikutnya tapi jeda build belum lewat -> tunggu sebentar di sini.
+        if CONFIG.flow and f.fireAt and os.clock()<f.fireAt and f.target.kind=="plant" then return end
         local t=f.target
         local kind=farmEligible(f,t.x,t.y)
         if kind~=t.kind then f.target=nil;f.pathSearch=nil;f.blockedOrder=nil;f.routeRetryAt=nil;f.candidates={};return end
@@ -3219,6 +3348,23 @@ local function farmTick()
             if data.status~="ready" then f.target=nil;return end
             log(string.format("HARVEST READY (%d,%d) SeedID=%d serverNow=%.3f readyAt=%.3f nativeReady=true",
                 t.x,t.y,f.seed,data.now,data.readyAt))
+        end
+        if kind=="plant" and CONFIG.flow and n.b.netCall and not n.glide then
+            local flow=f.flow
+            if not flow then flow={list={}};f.flow=flow end
+            if #flow.list==0 then
+                flow.base=inventoryNumber(n.b,"count",f.seed)
+                if flow.base==nil then halt("Inventory seed tidak terbaca.");return end
+            end
+            if #flow.list>=flow.base then return end -- stok habis; flush di tick berikutnya
+            local okPlant,errPlant=pcall(n.plant,f.seed,t.x,t.y)
+            if not okPlant then halt("Aksi farm native gagal: "..tostring(errPlant));return end
+            if farm~=f then return end
+            table.insert(flow.list,{x=t.x,y=t.y,at=os.clock()})
+            f.orderCursor=t.key;f.target=nil;f.blockedOrder=nil;f.routeRetryAt=nil
+            f.fireAt=os.clock()+.15 -- jeda build native game; hanya menahan tanam berikutnya, bukan jalannya
+            farmNote=string.format("Tanam beruntun (%d menunggu verifikasi).",#flow.list)
+            return
         end
         local before=inventoryNumber(n.b,"count",f.seed)
         if before==nil then halt("Inventory seed tidak terbaca.");return end
@@ -3264,6 +3410,11 @@ local function farmServerMoved()
     local recent={}
     for _,at in ipairs(f.corrections or {}) do if os.clock()-at<30 then table.insert(recent,at) end end
     table.insert(recent,os.clock());f.corrections=recent
+    -- PATCH AIRSKIP: kalau server mengembalikan posisi tak lama setelah skip, matikan skip sementara.
+    if f.lastSkipAt and os.clock()-f.lastSkipAt<3 then
+        f.noSkipUntil=os.clock()+120;f.lastSkipAt=nil
+        traceMotion("AIR SKIP ditolak server; dimatikan 120 detik, kembali berjalan biasa.")
+    end
     if #recent>=3 then halt("Server mengubah posisi berulang kali; farm dihentikan.");report(true);return end
     f.motion,f.target,f.scan=nil,nil,nil;f.pathSearch=nil;f.candidates={}
     f.speed=math.max(4,(f.speed or CONFIG.speed)*.65)
@@ -4376,7 +4527,7 @@ local function loopTick()
     local a,f=autoLoop,farm
     rp.dpGuard()
     if a and not a.paused and a.stage=="TANAM" and rp.noPlant() then loopStage(a,"PANEN") end
-    if not a or a.paused or not f or pending or f.action or f.job or f.correction or cycle then return end
+    if not a or a.paused or not f or pending or f.action or f.job or f.correction or cycle or (f.flow and #f.flow.list>0) then return end
     if not collecting then halt("Kolek tidak aktif; siklus dihentikan agar hasil farm tidak tertinggal.");return end
     local x,y,world=livePosition(a.native.b)
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
