@@ -4560,7 +4560,7 @@ do
         rp.phase="save";rp.takeSeed=true
         local ok=rp.beginWarp(rp.saveWorld,"ambil seed dari World Save (seed 0, blok 0, ada tile kosong)",false,"farm")
         if ok and rp.warp then rp.warp.take=true end
-        if not ok then rp.phase="farm";rp.takeSeed=false end
+        if not ok then rp.phase="farm";rp.takeSeed=false;rp.takeNext=os.time()+60 end
         return ok
     end
     local function endTake(a,why)
@@ -4579,6 +4579,7 @@ do
             halt("Farm World belum diisi.",true)
         end
     end
+    rp.endTake=endTake
     local function failDrop(t,uid)
         t.fails+=1;retryAt[uid]=os.clock()+60;t.g=nil
         if farm then farm.target,farm.motion=nil,nil end
@@ -4586,13 +4587,13 @@ do
     function rp.takeTick(a,x,y)
         local t=a.takeTrip
         if t.over then return end
+        if os.clock()-t.at>240 then endTake(a,"timeout 240 detik");return end
         local f=farm
         if not f or not f.native then return end
         local n=f.native
         if a.stage~="SETOR" then loopStage(a,"SETOR") end
         a.progressAt=os.clock()
         if t.base==nil then t.base=seedCount(a);t.range=collectRange end
-        if os.clock()-t.at>240 then endTake(a,"timeout 240 detik");return end
         local have=seedCount(a)
         local g=t.g
         if g then
@@ -4770,9 +4771,15 @@ local function loopTick()
     -- harvestOnly + Drop Seed OFF: seed diabaikan (hanya block yang di-drop).
     local seedFull=a.seeds>=200 and not (a.harvestOnly and not harvest.dropSeed)
     -- PATCH: seed 200 tetapi masih ada lahan yang bisa ditanam -> tanam dulu; setor hanya bila lahan sudah penuh.
-    if seedFull and not a.visit and not a.harvestOnly and a.stage~="PNB" and rp.canPlantMore(a,world) then
-        seedFull=false
-        if a.stage=="SETOR" then loopStage(a,"CEK") end
+    if seedFull and not a.visit and not a.harvestOnly and not a.pnbOnly then
+        -- Di stage PNB, setor tetap didahulukan bila memang bisa (trip World Save siap / mode box lokal). Bila setor belum
+        -- mungkin (mis. Ground Drop tetapi level < 10, cooldown, atau tidak di world farm), jangan menunggu: tanam dulu.
+        local canDeposit=rp.seedToSave(a,world) or not rp.ground()
+        if (a.stage~="PNB" or not canDeposit) and rp.canPlantMore(a,world) then
+            seedFull=false
+            local st=a.stage
+            if st=="SETOR" or st=="CEK" or st=="PNB" or st=="TUNGGU" then a.depositResume=nil;loopStage(a,"TANAM") end
+        end
     end
     if a.visit and seedFull then rp.leaveVisit(a,"seed 200 tercapai (setor di world farm)",false);return end
     if seedFull and rp.seedToSave(a,world) then
@@ -5447,6 +5454,10 @@ do
     end
     function rp.visitWatch()
         local a=autoLoop
+        -- PATCH AUTO TAKE SEED: watchdog mutlak; trip ambil seed tidak boleh macet walau loopTick tertahan (paused/action/job).
+        if a and a.takeTrip and not a.takeTrip.over and not rp.warp and not rp.shutdown and os.clock()-a.takeTrip.at>260 then
+            rp.endTake(a,"watchdog: trip macet");return
+        end
         if not a or not a.visit or rp.warp or rp.shutdown then return end
         if a.paused then
             if a.visitPausedRef~=a.paused then a.visitPausedRef=a.paused;a.visitPauses=(a.visitPauses or 0)+1 end
@@ -18736,7 +18747,7 @@ return RayfieldLibrary
         if not world then back("World Save tidak terbaca");return end
         task.wait(1.5)
         if rp.farmWorld and rp.name(world)==rp.name(rp.farmWorld) then
-            rp.phase="farm";ui.runCycle();return -- sudah di world farm
+            rp.phase="farm";rp.takeSeed=false;ui.runCycle();return -- sudah di world farm
         end
         if not rp.saveWorld or rp.name(world)~=rp.name(rp.saveWorld) then back("bukan World Save");return end
         ui.runCycle()
