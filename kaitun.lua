@@ -27,6 +27,7 @@ local CONFIG = { range=3, interval=0.06, retrySeconds=5, rpcTimeout=5, scanLimit
     speed=7, frameLimit=.05, sendInterval=1/15, timeout=180, maxReplans=20,
     pathNodeLimit=30000,pathTimeLimit=.25,
     flow=true,flowBatch=8,airSkip=true,airSkipMax=5 } -- PATCH FLOW: flow=false mengembalikan perilaku lama (verifikasi per tile); speed=5 = setelan khas kaitun
+CONFIG.seedDrop=150
 CONFIG.taken={} -- PATCH: uid -> {id,orig,taken}. Drop yang sudah DITERIMA server tidak boleh dihitung/diminta lagi.
 CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
 local Players = game:GetService("Players")
@@ -1159,7 +1160,7 @@ local farmModeButton=button("FarmMode","Tanam + Panen",190,185,218)
 local farmButton=button("Farm","Auto Farm: OFF",12,225,230)
 local scanButton=button("FarmScan","Cari lahan",250,225,158)
 local loopButton=button("AutoCycle","Siklus otomatis: OFF",12,263,396)
-label("Seed = blok + 1 | 200 seed: setor 100 ke Box "..tostring(rp.depositId).."",12,296,396)
+label("Seed = blok + 1 | 200 seed: setor 150 ke Box "..tostring(rp.depositId).."",12,296,396)
 local farmNote="Auto Farm OFF. Isi Seed ID; lahan dicari otomatis."
 local farmSummary="Scan pohon belum dilakukan."
 stopFarm=function(reason)
@@ -3623,6 +3624,14 @@ local function displayBinding(b)
     local history=pv and pv[b.netCall and 4 or 5]
     local identity=pv and pv[1]==b.inventory and pv[2]==b.state and type(history)=="table"
         and (b.netCall or pv[4]==remotes)
+    if not identity and liveS and b.inventory==liveS.inv then
+        history=nil
+        for _,k in ipairs({"worn","history","hist","wornItems","equipped","equip","wearing"}) do
+            local v=rawget(liveS,k)
+            if type(v)=="table" then history=v;break end
+        end
+        identity=type(history)=="table"
+    end
     local getValid=module and ownedArity(get,module,2)
     local rpcValid=remote~=nil
     local eventValid=event and event:IsA("RemoteEvent")
@@ -3637,6 +3646,12 @@ local function displayBinding(b)
         ..string.format("\nput markers=%s | captured identity=%s | get=%s | DisplayChanged handler=%s | DisplayItem=%s | DisplayChanged event=%s",
             tostring(not not putMarkers),tostring(not not identity),tostring(not not getValid),tostring(handler),
             tostring(not not rpcValid),tostring(not not eventValid))
+    local keys={}
+    if liveS then
+        for k,v in pairs(liveS) do if type(k)=="string" and type(v)=="table" then keys[#keys+1]=k end end
+        table.sort(keys)
+    end
+    note=note.."\nhistory="..tostring(history~=nil).." | liveS tables: "..table.concat(keys,",")
     if type(writefile)=="function" then pcall(writefile,"PNBRange_DisplayBinding.txt",note) end
     if not permission then return nil,"Kontrak izin petak native belum cocok." end
     if not ok then return {mayBuild=mayBuild,reason="Kontrak Display Box belum cocok; lihat PNBRange_DisplayBinding.txt."} end
@@ -3690,7 +3705,7 @@ local function loopStage(a,stage)
     running=false;cycle,anchor,settings=nil,nil,nil;runButton.Text="PNB: OFF"
     local notes={PNB="PNB aktif + Kolek ALL; setelah stok habis lanjut tanam.",TANAM="Menanam satu per satu; setiap pohon menunggu konfirmasi server.",
         PANEN="Memanen pohon matang satu per satu sampai lintasan selesai.",TUNGGU="Menunggu pohon matang; siklus tetap ON.",
-        SETOR="Menyiapkan setor 100 seed ke Display Box "..tostring(rp.depositId)..".",CEK="Membaca stok untuk tahap berikutnya."}
+        SETOR="Menyiapkan setor 150 seed ke Display Box "..tostring(rp.depositId)..".",CEK="Membaca stok untuk tahap berikutnya."}
     farmNote=notes[stage] or farmNote
     traceMotion("STAGE "..stage.." blok="..tostring(a.blocks).." seed="..tostring(a.seeds))
     log("SIKLUS -> "..stage.." | blok "..tostring(a.blocks).." | seed "..tostring(a.seeds))
@@ -3780,7 +3795,7 @@ local function depositTick(a,x,y)
         if not ok or type(snapshot)~="table" then halt("Snapshot backpack native untuk DisplayItem gagal.");return end
         d.before,d.boxBefore,d.at=a.seeds,n,os.clock();d.ack=nil;d.phase="put"
         log(string.format("SETOR SEND seed %d x100 -> Box "..tostring(rp.depositId).." (%d,%d), backpack %d, isi box %d.",a.seed,d.box.x,d.box.y,d.before,n))
-        request(d,a.display.remote,d.box.x,d.box.y,a.seed,snapshot,a.display.history,100,d.box.x+.5)
+        request(d,a.display.remote,d.box.x,d.box.y,a.seed,snapshot,a.display.history,CONFIG.seedDrop,d.box.x+.5)
     elseif d.phase=="put" then
         d.putReply=d.job.reply;d.phase="settle";d.settleAt=os.clock()+.25
     elseif d.phase=="settle" then
@@ -3790,8 +3805,8 @@ local function depositTick(a,x,y)
         if not loopInventory(a,d.job.reply,d) then return end
         local stored=displayHere(a,d.box)
         local accepted=d.putReply and d.putReply[1] and d.putReply[2]==true
-        local receipt=d.ack==d.boxBefore+100 or a.native.b.netCall and stored==d.boxBefore+100
-        if accepted and a.seeds==d.before-100 and receipt and stored==d.boxBefore+100 then
+        local receipt=d.ack==d.boxBefore+CONFIG.seedDrop or a.native.b.netCall and stored==d.boxBefore+CONFIG.seedDrop
+        if accepted and a.seeds==d.before-CONFIG.seedDrop and receipt and stored==d.boxBefore+CONFIG.seedDrop then
             if not d.counted then a.deposits+=1;d.counted=true end
             log(string.format("SETOR OK seed %d: backpack %d -> %d; Box (%d,%d) %d -> %d, DisplayChanged server OK.",
                 a.seed,d.before,a.seeds,d.box.x,d.box.y,d.boxBefore,stored))
@@ -3812,7 +3827,7 @@ do
     local WL_ID,WL_PRICE,MIN_LEVEL=242,2200,10
     local W=rp.wl
     function rp.wlItem() return {id=WL_ID,label="WL",per=100,need=function(c) return c>0 end} end
-    function rp.seedItem(a) return {id=a.seed,label="seed",per=100,need=function(c) return c>=200 end} end
+    function rp.seedItem(a) return {id=a.seed,label="seed",per=CONFIG.seedDrop,need=function(c) return c>=200 end} end
     -- PATCH: tidak lagi memblokir lewat cek izin lokal (mayBuild); server yang memutuskan. Penolakan ditangani
     -- jalur "SETOR ditolak tanpa debit". Box berisi item lain tidak lagi dianggap tidak ada (dipakai paling akhir).
     -- Mengembalikan jumlah item target, dan flag foreign bila box berisi item lain.
@@ -3896,10 +3911,19 @@ do
             if not item.need(have) then return "done" end
             local amt=math.min(item.per,have)
             local canDrop=rawget(b.state,"dropOk");local cv=upvalues(canDrop)
-            local packet=b.network and rawget(b.network,"drop");local send=type(packet)=="table" and rawget(packet,"send")
-            if not ownedArity(canDrop,b.controller,1) or not cv or cv[1]~=b.state or type(send)~="function"
-                or not hasConstants(canDrop,{"displayHere","jammerOn","fg","solid"}) then
-                return "fail","validasi ground-drop native belum tersedia"
+            local net=b.network
+            if type(net)~="table" or type(read(net,"drop"))~="table" then
+                local shared=RS:FindFirstChild("Shared");local mod=shared and shared:FindFirstChild("Net")
+                local okN,found=pcall(function() return mod and require(mod) end)
+                if okN and type(found)=="table" then net=found end
+            end
+            local packet=type(net)=="table" and read(net,"drop")
+            local send=type(packet)=="table" and read(packet,"send")
+            local layoutOk=cv and (cv[1]==b.state or liveS~=nil and type(cv[6])=="table")
+            local sigOk=ownedArity(canDrop,b.controller,1) and hasConstants(canDrop,{"displayHere","jammerOn","fg","solid"})
+            if not sigOk or not layoutOk or type(send)~="function" then
+                return "fail",string.format("validasi ground-drop gagal: signature=%s layout=%s send=%s net=%s",
+                    tostring(sigOk),tostring(layoutOk and true or false),typeof(send),typeof(net))
             end
             local t={id=item.id,dropX=dp.dest.dropX,dropY=y-.475}
             local ok,allowed=pcall(canDrop,t.dropX)
@@ -4832,8 +4856,8 @@ recoverLoop=function()
     if d and d.phase~="before" then
         local reply=d.putReply or (d.phase=="put" and d.job.reply)
         local stored=displayHere(a,d.box)
-        if a.seeds==d.before-100 and stored==d.boxBefore+100
-            and (d.ack==d.boxBefore+100 or a.native.b.netCall) then
+        if a.seeds==d.before-CONFIG.seedDrop and stored==d.boxBefore+CONFIG.seedDrop
+            and (d.ack==d.boxBefore+CONFIG.seedDrop or a.native.b.netCall) then
             if not d.counted then a.deposits+=1;d.counted=true end
             log("SETOR pulih: debit 100 dan isi box dikonfirmasi; tidak mengulang transaksi.")
             a.deposit,a.box=nil,nil;a.resumeStage=a.depositResume or "CEK";a.depositResume=nil
@@ -17755,7 +17779,7 @@ return RayfieldLibrary
         if rp.save then pcall(rp.save) end
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
-    main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box (default ID 1422, dapat diatur di tab Farm). If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
+    main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 150 in Display Box (default ID 1422, dapat diatur di tab Farm). If the world menu opens, return to the same farm world and resume. Right Ctrl toggles the window."})
     main:CreateButton({Name="Close",Callback=function() dispatch("Close") end})
     local inputMirrors={}
     local function normalizeFilter(text)
