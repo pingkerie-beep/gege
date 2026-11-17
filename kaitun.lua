@@ -138,7 +138,7 @@ local worldReturn={}
 -- Random-world PNB (GenHub 1.9.3). State is shared by the cycle code and the Rayfield UI.
 local rp={depositId=1422,pnbDrop=true,enabled=false,farmWorld=nil,phase="farm",visitFails=0,cooldownUntil=0,keepOn=false,
     warp=nil,save=nil,shutdown=false,
-    buyWL=false,saveWorld=nil,dontPlant=false,wl={level=0,cool=0,nextAt=0,checked=false}}
+    buyWL=false,saveWorld=nil,dontPlant=false,takeSeed=false,takeNext=0,wl={level=0,cool=0,nextAt=0,checked=false}}
 -- Harvest mode state (GenHub 1.9.3+). Harvest only without planting.
 local harvest={enabled=false,blockId=nil,farmWorld=nil,saveWorld=nil,depositId=1422,dropSeed=false,harvested=0,active=false,prev=nil}
 -- FIX: engine hanya membaca rp.farmWorld/rp.saveWorld/rp.depositId. Pengaturan tab Harvest disalin ke rp saat
@@ -4095,7 +4095,7 @@ do
     -- Perjalanan ke World Save.
     function rp.startSaveTrip(a,why)
         if rp.warp or not rp.saveWorld or not rp.farmWorld then return false end
-        rp.phase="save"
+        rp.phase="save";rp.takeSeed=false
         local ok=rp.beginWarp(rp.saveWorld,"setor "..tostring(why).." ke World Save",false,"farm")
         if ok and rp.warp then rp.warp.save=true end
         if not ok then rp.phase="farm" end
@@ -4509,6 +4509,160 @@ CONFIG.findBlockStep=function(a,x,y)
     end
     finish(false,"tahap tidak dikenal")
 end
+-- PATCH AUTO TAKE SEED: world farm punya tile kosong, inventory tanpa seed/blok -> ambil seed (drop) dari World Save,
+-- tanam di World Farm. Seed tidak ada/habis -> balik ke World Farm, ulangi cek World Save setiap 5 menit.
+do
+    local TAKE_MAX=199 -- >=200 memicu setor seed otomatis; jangan sampai terambil melebihi ini
+    local function seedCount(a) return inventoryNumber(a.native.b,"count",a.seed) or 0 end
+    local function hasPlantable(f)
+        local n=f.native
+        pcall(refreshTrees,n)
+        for ty=0,n.height-2 do
+            for tx=0,n.width-1 do
+                if farmTile(n,tx,ty)==0 and rawget(n.trees,ty*n.width+tx)==nil then
+                    local below=farmTile(n,tx,ty+1)
+                    local support=below and rawget(n.b.itemDB,below)
+                    if type(support)=="table" and (rawget(support,"solid")==true or rawget(support,"platform")==true) then return true end
+                end
+            end
+        end
+        return false
+    end
+    -- Masih ada lahan yang bisa ditanam? (dicache 2 dtk; a.plantFull = scan TANAM baru saja menyatakan lahan penuh)
+    function rp.canPlantMore(a,world)
+        if rp.noPlant() then return false end
+        if rp.farmWorld and rp.name(world)~=rp.name(rp.farmWorld) then return false end
+        if os.clock()<(a.plantFull or 0) then return false end
+        local f=farm
+        if not f or not f.native then return false end
+        if os.clock()>=(a.plantChk or 0) then
+            a.plantChk=os.clock()+2
+            local ok,has=pcall(hasPlantable,f)
+            a.plantHas=ok and has==true
+        end
+        return a.plantHas==true
+    end
+    function rp.takeReady(a,world)
+        if not (rp.saveWorld and rp.farmWorld) or rp.warp or rp.phase~="farm" then return false end
+        if a.visit or a.harvestOnly or a.pnbOnly or a.saveTrip or a.takeTrip or a.dp or a.deposit then return false end
+        if rp.noPlant() or (a.blocks or 0)>0 or (a.seeds or 0)>0 then return false end
+        if rp.name(world)~=rp.name(rp.farmWorld) or os.time()<(rp.takeNext or 0) then return false end
+        if os.clock()<(a.takeChk or 0) then return false end
+        a.takeChk=os.clock()+3
+        local f=farm
+        if not f or not f.native then return false end
+        local ok,has=pcall(hasPlantable,f)
+        if not ok or not has then return false end
+        return true
+    end
+    function rp.startTakeTrip(a)
+        if rp.warp or not rp.saveWorld or not rp.farmWorld then return false end
+        rp.phase="save";rp.takeSeed=true
+        local ok=rp.beginWarp(rp.saveWorld,"ambil seed dari World Save (seed 0, blok 0, ada tile kosong)",false,"farm")
+        if ok and rp.warp then rp.warp.take=true end
+        if not ok then rp.phase="farm";rp.takeSeed=false end
+        return ok
+    end
+    local function endTake(a,why)
+        local t=a.takeTrip
+        if not t or t.over then return end
+        t.over=true
+        local f=farm
+        if f then f.target,f.motion=nil,nil end
+        if t.range and collectRange and collectRange>t.range then collectRange=t.range end
+        local got=seedCount(a)-(t.base or 0)
+        rp.takeSeed=false
+        rp.phase="farm"
+        if got>0 then rp.takeNext=0 else rp.takeNext=os.time()+300 end
+        log(string.format("AMBIL SEED selesai (%s): +%d seed. %s",tostring(why),got,got>0 and "Kembali ke Farm World untuk menanam." or "Cek World Save lagi 5 menit kemudian."))
+        if not rp.farmWorld or not rp.beginWarp(rp.farmWorld,"kembali ke Farm World (ambil seed: "..tostring(why)..")",true,"save") then
+            halt("Farm World belum diisi.",true)
+        end
+    end
+    local function failDrop(t,uid)
+        t.fails+=1;retryAt[uid]=os.clock()+60;t.g=nil
+        if farm then farm.target,farm.motion=nil,nil end
+    end
+    function rp.takeTick(a,x,y)
+        local t=a.takeTrip
+        if t.over then return end
+        local f=farm
+        if not f or not f.native then return end
+        local n=f.native
+        if a.stage~="SETOR" then loopStage(a,"SETOR") end
+        a.progressAt=os.clock()
+        if t.base==nil then t.base=seedCount(a);t.range=collectRange end
+        if os.clock()-t.at>240 then endTake(a,"timeout 240 detik");return end
+        local have=seedCount(a)
+        local g=t.g
+        if g then
+            if g.phase=="go" then
+                if f.motion then
+                    if os.clock()-g.at>20 then failDrop(t,g.uid) end
+                    return
+                end
+                local s=g.stand
+                if math.abs(x-(s.x+.5))<=.4 and math.abs(y-(s.y+.999))<=.55 then
+                    g.phase,g.at,g.have="collect",os.clock(),have
+                    denied[g.uid]=nil;retryAt[g.uid]=nil;nextCollect=0
+                elseif os.clock()-g.at>20 then failDrop(t,g.uid)
+                else
+                    local route=farmPlan(f,s,x,y)
+                    if route then f.target,f.motion=s,route else failDrop(t,g.uid) end
+                end
+                return
+            end
+            -- collect: tunggu server menerima drop (jumlah seed bertambah)
+            if have>g.have then t.g=nil;return end
+            nextCollect=0
+            if os.clock()-g.at>6 then failDrop(t,g.uid) end
+            return
+        end
+        if t.fails>=4 then endTake(a,have>t.base and "sebagian terambil" or "gagal mengambil drop");return end
+        if have>=TAKE_MAX then endTake(a,"seed penuh");return end
+        local list=records(n.b)
+        local found,scanned={},0
+        for _,r in next,(list or {}) do
+            scanned+=1;if scanned>CONFIG.scanLimit then break end
+            if worldDrop(n.b,r) and r.id==a.seed and (retryAt[r.uid] or 0)<=os.clock() and have+r.n<=TAKE_MAX then
+                found[#found+1]={record=r,uid=r.uid,d=(r.x-x)^2+(r.y-(y-.475))^2}
+            end
+        end
+        if #found==0 then
+            if os.clock()-t.at<6 then farmNote="AMBIL SEED: menunggu drop World Save dimuat.";return end
+            endTake(a,have>t.base and "seed habis" or "tidak ada seed di World Save");return
+        end
+        table.sort(found,function(l,r) return l.d<r.d end)
+        local needs=math.max(collectRange or CONFIG.range,3)
+        if (collectRange or 0)<needs then collectRange=needs end
+        -- Drop terdekat sudah dalam jangkauan: langsung kolek tanpa pindah.
+        if found[1].d<=(needs-1)^2 then
+            t.g={phase="collect",at=os.clock(),uid=found[1].uid,have=have}
+            denied[found[1].uid]=nil;retryAt[found[1].uid]=nil;nextCollect=0
+            farmNote="AMBIL SEED: mengambil drop seed di dekat posisi."
+            return
+        end
+        local attempts=0
+        for i=1,math.min(#found,8) do
+            local r=found[i].record
+            for _,s in ipairs(findBlockStand(n,r.x,r.y,needs)) do
+                attempts+=1;if attempts>12 then break end
+                local route=farmPlan(f,s,x,y)
+                if route then
+                    t.g={phase="go",stand=s,at=os.clock(),uid=r.uid}
+                    f.target,f.motion=s,route
+                    farmNote=string.format("AMBIL SEED: menuju drop seed di (%d,%d).",math.floor(r.x),math.floor(r.y))
+                    log(farmNote)
+                    return
+                end
+            end
+            if attempts>12 then break end
+        end
+        t.fails+=1
+        for i=1,math.min(#found,8) do retryAt[found[i].uid]=os.clock()+60 end
+        farmNote="AMBIL SEED: tidak ada rute ke drop seed."
+    end
+end
 local function beginFindBlock(a,x,y)
     local f=farm
     if not f or not f.native then return false end
@@ -4557,6 +4711,7 @@ local function loopTick()
     if not x or world~=a.world then halt("World/posisi siklus berubah.");return end
     if rp.warp then farmNote="Warp ke "..rp.warp.target.." ...";return end
     if a.saveTrip then rp.tripTick(a,x,y);return end
+    if a.takeTrip then rp.takeTick(a,x,y);return end -- PATCH AUTO TAKE SEED
     if a.deposit then depositTick(a,x,y);return end
     if a.dp then rp.localDep(a,x,y);return end
     if a.hop then CONFIG.hopStep(a,x,y);return end
@@ -4614,6 +4769,11 @@ local function loopTick()
     end
     -- harvestOnly + Drop Seed OFF: seed diabaikan (hanya block yang di-drop).
     local seedFull=a.seeds>=200 and not (a.harvestOnly and not harvest.dropSeed)
+    -- PATCH: seed 200 tetapi masih ada lahan yang bisa ditanam -> tanam dulu; setor hanya bila lahan sudah penuh.
+    if seedFull and not a.visit and not a.harvestOnly and a.stage~="PNB" and rp.canPlantMore(a,world) then
+        seedFull=false
+        if a.stage=="SETOR" then loopStage(a,"CEK") end
+    end
     if a.visit and seedFull then rp.leaveVisit(a,"seed 200 tercapai (setor di world farm)",false);return end
     if seedFull and rp.seedToSave(a,world) then
         if a.stage~="SETOR" then a.depositResume=a.stage end
@@ -4739,6 +4899,7 @@ local function loopTick()
         running=true;nextAction=os.clock();runButton.Text="PNB: ON"
     elseif a.stage=="TANAM" then
         f.mode="plant"
+        if a.seeds>0 and f.lastScan and not f.scan and f.lastScan.actionable==0 then a.plantFull=os.clock()+30 end
         if a.seeds==0 or f.lastScan and not f.scan and f.lastScan.actionable==0 then loopStage(a,"PANEN") end
     elseif a.stage=="PANEN" then
         f.mode="harvest"
@@ -4770,6 +4931,8 @@ local function loopTick()
             elseif a.blocks>0 then loopStage(a,"PNB")
             elseif a.seeds>0 then loopStage(a,"TANAM") end
             farmNote="Menunggu pohon matang; siklus tetap ON dan scan berlanjut."
+            -- PATCH AUTO TAKE SEED: tidak ada pohon matang/seed/blok, tetapi ada tile kosong -> ambil seed dari World Save.
+            if a.stage=="TUNGGU" and a.blocks==0 and a.seeds==0 and rp.takeReady(a,world) then rp.startTakeTrip(a) end
         end
     end
 end
@@ -5248,7 +5411,8 @@ do
                 rp.beginWarp(rp.farmWorld,"warp ke world random gagal; kembali ke farm",true,"visit")
             else
                 rp.phase="farm"
-                if w.save then rp.wl.cool=os.time()+300 else rp.cooldownUntil=os.time()+300 end
+                if w.take then rp.takeSeed=false;rp.takeNext=os.time()+300
+                elseif w.save then rp.wl.cool=os.time()+300 else rp.cooldownUntil=os.time()+300 end
                 rp.keepOn=false
                 if rp.save then pcall(rp.save) end
                 log("Warp gagal 6x; PNB lokal dipakai 5 menit. Lihat PNBRange_Warp.txt.")
@@ -17822,7 +17986,7 @@ return RayfieldLibrary
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
             fpsBoost=data.fpsBoost~=false,render3dOff=data.render3dOff~=false,depositId=data.depositId or 1422,
             farmOn=data.farmOn==true,pnbOn=data.pnbOn==true,pnbDrop=data.pnbDrop~=false,hideUsername=data.hideUsername==true,
-            randomPnb=data.randomPnb==true,
+            randomPnb=data.randomPnb==true,takeSeed=data.takeSeed==true,takeNext=(type(data.takeNext)=="number" and data.takeNext==data.takeNext) and data.takeNext or 0,
             farmWorld=type(data.farmWorld)=="string" and rp.name(data.farmWorld) or nil,
             buyWL=data.buyWL==true,dontPlant=data.dontPlant==true,
             saveWorld=type(data.saveWorld)=="string" and rp.name(data.saveWorld) or nil,
@@ -17846,7 +18010,7 @@ return RayfieldLibrary
             fpsBoost=boost.lite,render3dOff=boost.render3d,depositId=rp.depositId,pnbDrop=rp.pnbDrop~=false,
             farmOn=(autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)) or rp.keepOn==true,
         pnbOn=autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit,
-        randomPnb=rp.enabled,farmWorld=rp.farmWorld,buyWL=rp.buyWL,dontPlant=rp.dontPlant==true,saveWorld=rp.saveWorld,wlCool=rp.wl.cool,wlLevel=(ui.scope=="user") and rp.wl.level or 0,wlUser=(ui.scope=="user") and tostring(player.Name) or nil,phase=rp.phase,lastWorld=rp.lastWorld,visitFails=rp.visitFails,cooldownUntil=rp.cooldownUntil,
+        randomPnb=rp.enabled,takeSeed=rp.takeSeed==true,takeNext=rp.takeNext or 0,farmWorld=rp.farmWorld,buyWL=rp.buyWL,dontPlant=rp.dontPlant==true,saveWorld=rp.saveWorld,wlCool=rp.wl.cool,wlLevel=(ui.scope=="user") and rp.wl.level or 0,wlUser=(ui.scope=="user") and tostring(player.Name) or nil,phase=rp.phase,lastWorld=rp.lastWorld,visitFails=rp.visitFails,cooldownUntil=rp.cooldownUntil,
         harvestBlockId=harvest.blockId,harvestFarmWorld=harvest.farmWorld,harvestSaveWorld=harvest.saveWorld,
         harvestDepositId=harvest.depositId,harvestDropSeed=harvest.dropSeed==true,
         harvestOn=harvest.active==true or (autoLoop~=nil and autoLoop.harvestOnly==true)})
@@ -18564,7 +18728,7 @@ return RayfieldLibrary
             task.wait(.5)
         end
         local function back(why)
-            rp.phase="farm"
+            rp.phase="farm";rp.takeSeed=false
             if not rp.farmWorld or not rp.beginWarp(rp.farmWorld,why,true,"save") then
                 log("Farm World belum diisi; tidak bisa kembali otomatis.")
             end
@@ -18577,6 +18741,11 @@ return RayfieldLibrary
         if not rp.saveWorld or rp.name(world)~=rp.name(rp.saveWorld) then back("bukan World Save");return end
         ui.runCycle()
         if not autoLoop then back("siklus tidak bisa dimulai di World Save");return end
+        if rp.takeSeed then -- PATCH AUTO TAKE SEED: di World Save hanya mengambil seed, tidak setor
+            autoLoop.takeTrip={at=os.clock(),fails=0}
+            log("World Save: di world "..tostring(world).."; mode AMBIL seed untuk ditanam di Farm World.")
+            return
+        end
         local plan={}
         if autoLoop.harvestOnly then
             table.insert(plan,harvest.blockItem(autoLoop))
@@ -18618,7 +18787,7 @@ return RayfieldLibrary
         local function flag(v,default) if v==nil then return default end return v==true end
         local mode=(str(c.mode) or "farm"):lower()
         local d={version=1,autoLoad=true}
-        for _,k in ipairs({"phase","lastWorld","visitFails","cooldownUntil","wlCool","wlLevel","wlUser"}) do d[k]=base[k] end
+        for _,k in ipairs({"phase","lastWorld","visitFails","cooldownUntil","wlCool","wlLevel","wlUser","takeSeed","takeNext"}) do d[k]=base[k] end
         d.targetId=tonumber(c.target) or tonumber(idInput.Text)
         d.pnbId=tonumber(c.pnbid)
         d.hits=tonumber(c.hits) or 3
@@ -18665,9 +18834,9 @@ return RayfieldLibrary
                     ui.configLoaded=true;ui.configStatus="Saved configuration loaded. Ready to start."
                     rp.enabled,rp.farmWorld,rp.phase=valid.randomPnb,valid.farmWorld,valid.phase
                     rp.visitFails,rp.cooldownUntil,rp.lastWorld=valid.visitFails,valid.cooldownUntil,valid.lastWorld
-                    rp.buyWL,rp.saveWorld,rp.wl.cool=valid.buyWL,valid.saveWorld,valid.wlCool;rp.dontPlant=valid.dontPlant==true
+                    rp.buyWL,rp.saveWorld,rp.wl.cool=valid.buyWL,valid.saveWorld,valid.wlCool;rp.dontPlant=valid.dontPlant==true;rp.takeSeed,rp.takeNext=valid.takeSeed,valid.takeNext
                     if valid.wlUser==tostring(player.Name) and valid.wlLevel>(rp.wl.level or 0) then rp.wl.level=valid.wlLevel end
-                    if (rp.phase=="visit" or rp.phase=="save") and not valid.farmOn then rp.phase="farm" end
+                    if (rp.phase=="visit" or rp.phase=="save") and not valid.farmOn then rp.phase="farm";rp.takeSeed=false end
                     if valid.farmOn then ui.pendingAutoStart=(rp.phase=="visit" and rp.enabled and rp.farmWorld) and "visit" or (rp.phase=="save" and rp.saveWorld and rp.farmWorld) and "save" or "farm";ui.configStatus="Saved configuration loaded. Start Farm resumed."
                     elseif valid.pnbOn and valid.pnbId then ui.pendingAutoStart="pnb";ui.configStatus="Saved configuration loaded. Start PNB resumed."
                     elseif valid.harvestOn and valid.harvestBlockId then
