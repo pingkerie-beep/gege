@@ -117,6 +117,13 @@ end
 function compatibility.context(b)
     if not b or not b.gameGui or not b.gameGui:IsDescendantOf(playerGui) or not b.camera
         or not b.camera:IsDescendantOf(b.gameGui) then return false end
+    if b.observation then
+        return compatibility.aggregateWorld(b.observation.state,b.gameGui)==b.state
+            and rawget(b.observation.state,"view")==b.camera
+            and rawget(b.observation.state,"Items")==b.itemDB
+            and read(b.observation.connection,"Enabled")~=false
+            and read(b.observation.connection,"Function")==b.renderer
+    end
     return b.controller.Parent==b.gameGui
         or b.template~=nil and b.template==b.gameGui:FindFirstChild("Game")
         or b.runtime==true and functionOwner(b.renderer)==b.controller and rawget(b.state,"goTo")==b.positionFn
@@ -158,10 +165,91 @@ function compatibility.exportRuntime(b)
         end
     end
 end
+function compatibility.aggregateWorld(state,gui)
+    local world=type(state)=="table" and rawget(state,"world")
+    if type(world)~="table" or rawget(state,"gui")~=gui then return nil end
+    local frame,view=rawget(state,"worldFrame"),rawget(state,"view")
+    if typeof(frame)~="Instance" or typeof(view)~="Instance" or frame.Parent~=gui
+        or view.Parent~=frame or not view:IsDescendantOf(playerGui)
+        or type(rawget(world,"goTo"))~="function" or type(rawget(world,"enter"))~="function" then return nil end
+    return world
+end
+function compatibility.aggregatePosition(observation)
+    observation=observation or compatibility.aggregate
+    if not observation or read(observation.connection,"Enabled")==false
+        or read(observation.connection,"Function")~=observation.renderer then return nil end
+    local state,gui=observation.state,observation.gui
+    if gui~=playerGui:FindFirstChild("GameGui") then return nil end
+    local world=compatibility.aggregateWorld(state,gui)
+    if not world then return nil end
+    local name,w,h=rawget(world,"name"),rawget(world,"w"),rawget(world,"h")
+    local x,y,hp=rawget(state,"px"),rawget(state,"py"),rawget(state,"hp")
+    if type(name)~="string" or name=="" or not integer(w) or not integer(h) or w<=0 or h<=0
+        or type(rawget(world,"fg"))~="table" or not finite(x) or not finite(y) or not finite(hp)
+        or x<0 or x>w or y< -4 or y>h then return nil end
+    return x,y,name,hp
+end
+function compatibility.aggregateData(observation)
+    local state,gui=observation.state,observation.gui
+    local world=compatibility.aggregateWorld(state,gui)
+    if not world or rawget(world,"enter")~=rawget(state,"enterWorld") then return nil end
+    local goTo=rawget(world,"goTo")
+    local controller=functionOwner(goTo)
+    local goToRefs=upvalues(goTo)
+    if typeof(controller)~="Instance" or not ownedArity(goTo,controller,2)
+        or not goToRefs or goToRefs[1]~=state or not hasConstants(goTo,{"px","py","world","dead"}) then return nil end
+
+    local inventory,methods,items=rawget(state,"inv"),rawget(state,"Inventory"),rawget(state,"Items")
+    if type(inventory)~="table" or type(methods)~="table" or type(items)~="table"
+        or type(rawget(inventory,"slots"))~="table" or not integer(rawget(inventory,"capacity")) then return nil end
+    local room,count=rawget(methods,"room"),rawget(methods,"count")
+    local owner=functionOwner(room)
+    if typeof(owner)~="Instance" or not ownedArity(room,owner,2) or not ownedArity(count,owner,2)
+        or read(inventory,"room")~=room or read(inventory,"count")~=count
+        or not captures(upvalues(room),items) then return nil end
+    return {observation=observation,aggregate=state,state=world,controller=controller,gameGui=gui,positionFn=goTo,
+        camera=rawget(state,"view"),renderer=observation.renderer,itemDB=items,inventory=inventory}
+end
+function compatibility.aggregatePickup(b)
+    local state=b.aggregate
+    local others=rawget(state,"others")
+    if type(others)~="table" or type(rawget(state,"drops"))~="table" then return false end
+    local update,sendHit=rawget(others,"update"),rawget(others,"sendHit")
+    local owner=functionOwner(update)
+    if typeof(owner)~="Instance" or not ownedArity(update,owner,4) or not ownedArity(sendHit,owner,2) then return false end
+    local updateRefs,hitRefs=upvalues(update),upvalues(sendHit)
+    local sender=updateRefs and updateRefs[1]
+    local senderRefs=upvalues(sender)
+    if not ownedArity(sender,owner,1) or not hasConstants(sender,{"state","move","send","flags"})
+        or not senderRefs or type(senderRefs[1])~="table" or senderRefs[1]~=updateRefs[2]
+        or rawget(senderRefs[1],"solidAt")~=rawget(state,"solidAt") then return false end
+    local net=senderRefs[5]
+    local calls=type(net)=="table" and rawget(net,"CALLS")
+    if not hitRefs or hitRefs[1]~=net or type(calls)~="table"
+        or not rawget(calls,"GetInventory") or not rawget(calls,"GetGems") then return false end
+    local call,take=rawget(b.state,"call"),rawget(b.state,"takeDrop")
+    local ok,arity,vararg=pcall(debug.info,call,"a")
+    if not ok or arity~=0 or not vararg or not ownerMatches(call,b.controller)
+        or (upvalues(call) or {})[1]~=state or not hasConstants(call,{"require","Shared","Net","call"}) then return false end
+    local takeOwner=functionOwner(take)
+    if typeof(takeOwner)~="Instance" or not ownedArity(take,takeOwner,2) or (upvalues(take) or {})[1]~=state
+        or not hasConstants(take,{"ask","take","took","uid","want","got"}) then return false end
+    local setter=rawget(state,"setDropCount")
+    if not ownedArity(setter,b.controller,2) or (upvalues(setter) or {})[1]~=state
+        or not hasConstants(setter,{"drops","n","count","remove","Destroy"}) then return false end
+    local add,remove=read(b.inventory,"add"),read(b.inventory,"remove")
+    local inventoryOwner=functionOwner(read(b.inventory,"room"))
+    if not ownedArity(add,inventoryOwner,3) or not ownedArity(remove,inventoryOwner,3) then return false end
+    b.network,b.netCall,b.takeDrop=net,call,take
+    b.setDropCount=setter
+    b.inventoryAdd,b.inventoryRemove=add,remove
+    return true
+end
 function compatibility.renderer(gui,allowMenu)
     local ok,list=pcall(getconnections,RunService.RenderStepped)
+    compatibility.aggregate=nil
     if not ok or type(list)~="table" then return nil end
-    local found
+    local found,aggregate,ambiguous
     for index,connection in ipairs(list) do
         if index>64 then break end
         local fn=read(connection,"Function");local owner=functionOwner(fn)
@@ -180,6 +268,10 @@ function compatibility.renderer(gui,allowMenu)
             local uv=upvalues(fn);local state=uv and uv[1];local camera,world=uv and uv[4],uv and uv[6]
             local goTo=type(state)=="table" and rawget(state,"goTo")
             local gv=ownedArity(goTo,owner,2) and upvalues(goTo)
+            if compatibility.aggregateWorld(state,gui) then
+                if aggregate then ambiguous=true end
+                aggregate={state=state,gui=gui,renderer=fn,connection=connection}
+            end
             if typeof(camera)=="Instance" and camera:IsA("Frame") and typeof(world)=="Instance"
                 and world.Parent==gui and camera.Parent==world and camera:IsDescendantOf(playerGui)
                 and hasConstants(goTo,{"Vector2","new","deadAt"}) and gv and gv[3]==state
@@ -192,6 +284,7 @@ function compatibility.renderer(gui,allowMenu)
             end
         end
     end
+    if not found and not ambiguous then compatibility.aggregate=aggregate end
     if found then compatibility.others(found);compatibility.exportRuntime(found) end
     return found
 end
@@ -319,6 +412,7 @@ local function nativeStateSnapshot(b)
 end
 local function nativePosition(b)
     if not b or not b.renderer or not compatibility.context(b) then return nil end
+    if b.observation then return compatibility.aggregatePosition(b.observation) end
     local values=upvalues(b.renderer)
     if not values or values[1]~=b.state then return nil end
     local x,y,hp=values[20],values[21],values[37]
@@ -334,7 +428,8 @@ end
 local function positionSnapshot(b)
     local x,y,world,hp=debugPosition()
     if x then return x,y,world,hp end
-    return nativePosition(b or binding)
+    if b or binding then return nativePosition(b or binding) end
+    return compatibility.aggregatePosition()
 end
 local function callbacks(name,controller,b)
     b=b or (compatibility.active and compatibility.active.controller==controller and compatibility.active)
@@ -374,6 +469,11 @@ local function bind(force)
     local camera=worldGui and worldGui:FindFirstChild("Camera")
     local native=gameGui and compatibility.renderer(gameGui)
     if native then controller,camera=native.controller,native.camera;compatibility.active=native end
+    if not native and compatibility.aggregate then
+        adapterStatus="World and position use the new game layout. Farm actions are waiting for a compatible binding."
+        binding=compatibility.aggregateData(compatibility.aggregate)
+        return binding
+    end
     local x,y=debugPosition()
     if not controller or not camera or (not x and gameGui:FindFirstChild("Debug")) then
         adapterStatus="Posisi GameGui belum terbaca."..(compatibility.lastProbe and " "..compatibility.lastProbe or "");return nil
@@ -600,6 +700,10 @@ end
 local function livePosition(b)
     if not b then return nil end
     local x,y,world,hp=positionSnapshot(b)
+    if b.observation then
+        if x and hp and hp>0 and rawget(b.observation.state,"dead")==false then return x,y,world end
+        return nil
+    end
     local values=b and upvalues(b.positionFn)
     if not x or not values or not finite(values[1]) or not finite(values[2]) then return nil end
     if math.abs(values[1]-x)>.5 or math.abs(values[2]-y)>.5 then return nil end
@@ -705,6 +809,10 @@ local function playBlockEffects(b,place,c,lastHit,totalHits)
     if not ok then fx.disabled=true;clearBlockEffects();log("PNB block effects unavailable: native effect rendering failed.") end
 end
 local function records(b)
+    if b.aggregate then
+        local list=rawget(b.aggregate,"drops")
+        return compatibility.context(b) and type(list)=="table" and list or nil
+    end
     local values=upvalues(b.dropFn)
     local list=values and values[b.dropIndex]
     return type(list)=="table" and list or nil
@@ -716,7 +824,8 @@ local function worldDrop(b,r)
     return integer(uid) and uid>=0 and integer(id) and id>0 and integer(n) and n>0
         and finite(x) and finite(y) and not rawget(r,"display")
         and typeof(frame)=="Instance" and frame:IsDescendantOf(b.camera)
-        and (id~=112 or frame:FindFirstChild("Gem")~=nil or (b.template~=nil or b.runtime) and type(b.network)=="table")
+        and (id~=112 or frame:FindFirstChild("Gem")~=nil
+            or (b.template~=nil or b.runtime or b.aggregate) and type(b.network)=="table")
 end
 local function validDrop(b,r)
     return worldDrop(b,r) and rawget(r,"armed")~=false and not rawget(r,"taking") and not rawget(r,"pending")
@@ -950,13 +1059,14 @@ local function oldRunning()
     end
     return visit(old,0)
 end
-local function canStart()
+local function canStart(mode)
     if (lease.outstanding or 0)>0 then return nil,"Tunggu permintaan server sebelumnya selesai." end
     local other=rawget(env,"_GemTargetRPC_v1")
     if type(other)=="table" and (other.outstanding or 0)>0 then return nil,"Tunggu proses GemTarget sebelumnya selesai." end
     if oldRunning() then return nil,"Matikan TOGGLE PNB lama dahulu." end
     local b=bind(true)
     if not b then return nil,adapterStatus end
+    if b.observation and mode~="stationary" then return nil,adapterStatus end
     local x,y,world=livePosition(b)
     if not x then return nil,"Posisi aktif/mati/ghost belum cocok." end
     return b,x,y,world
@@ -1448,6 +1558,55 @@ end
 
 
 
+-- BEGIN AGGREGATE FARM
+function compatibility.aggregateFarm(b, mode)
+    if mode ~= "stationary" then
+        return nil, "Auto Farm movement is unavailable on this game layout."
+    end
+
+    local state = b and b.aggregate
+    local world = type(state) == "table" and rawget(state, "world")
+    if type(world) ~= "table" or world ~= b.state or not compatibility.context(b)
+        or type(b.netCall) ~= "function" or type(b.inventory) ~= "table" or type(b.itemDB) ~= "table"
+        or rawget(state, "inv") ~= b.inventory or rawget(state, "Items") ~= b.itemDB then
+        return nil, "The live PNB world and inventory could not be verified."
+    end
+
+    local function verified(fn, owner, arity, markers)
+        if typeof(owner) ~= "Instance" or not (owner:IsA("LocalScript") or owner:IsA("ModuleScript") or owner:IsA("Script"))
+            or not ownedArity(fn, owner, arity) or not hasConstants(fn, markers) then
+            return false
+        end
+        local refs = upvalues(fn)
+        return refs ~= nil and refs[1] == state and next(refs, 1) == nil
+    end
+
+    local controller = functionOwner(b.positionFn)
+    local canPlace = rawget(state, "canPlace")
+    local setTile = rawget(state, "setTile")
+    local hit = rawget(state, "hit")
+    local inWorld = rawget(state, "inWorld")
+    local inReach = rawget(state, "inReach")
+    if rawget(world, "goTo") ~= b.positionFn
+        or not verified(canPlace, controller, 3, {"inWorld", "inReach", "canEdit", "seed", "platform"})
+        or not verified(setTile, controller, 6, {"Shared", "Net", "tile", "send", "layer", "flip", "placedAt", "world"})
+        or not verified(hit, functionOwner(hit), 4, {"world", "fg", "bg", "tree_harvest", "mayBuild", "punchLocked", "setTile"})
+        or not verified(inWorld, controller, 2, {"world", "w", "h"})
+        or not verified(inReach, controller, 3, {"invUI", "buildRange", "px", "py", "H"}) then
+        return nil, "The native PNB action and reach functions could not be verified."
+    end
+
+    return {
+        b = b,
+        canPlace = canPlace,
+        setTile = setTile,
+        hit = function(x, y)
+            assert(inWorld(x, y) == true and inReach(x, y) == true, "PNB target is outside native reach.")
+            return hit(x, y)
+        end,
+    }
+end
+-- END AGGREGATE FARM
 local function farmBinding(b)
     local notes,controller={},b.controller
     local function save(note)
@@ -3581,7 +3740,42 @@ do
         if type(value)~="string" or #value<1 or #value>64 or value:find("[^%w_%-]") then return nil end
         return value:upper()
     end
+-- BEGIN AGGREGATE MENU
+-- The newer renderer owns the mounted menu separately from the world actions.
+local function aggregateMenuEntry(b)
+    local state=b.observation and b.observation.state
+    if not state or not compatibility.context(b) then return nil end
+    local menu=rawget(state,"menuUI")
+    if type(menu)~="table" then return nil end
+
+    local enter,blocking=rawget(menu,"enter"),rawget(menu,"blocking")
+    local module=functionOwner(enter)
+    if typeof(module)~="Instance" or not (module:IsA("ModuleScript") or module:IsA("Script") or module:IsA("LocalScript"))
+        or not ownedArity(enter,module,1) or not ownedArity(blocking,module,0)
+        or not hasConstants(enter,{"Visible"}) or not hasConstants(blocking,{"Visible"}) then return nil end
+
+    local native=rawget(state,"enterWorld")
+    local nativeOwner=functionOwner(native)
+    local nativeRefs=upvalues(native)
+    if native~=rawget(b.state,"enter") or typeof(nativeOwner)~="Instance" or not ownedArity(native,nativeOwner,2)
+        or not nativeRefs or nativeRefs[1]~=state
+        or not hasConstants(native,{"world","arriveDoor","InvokeServer","goTo"}) then return nil end
+
+    local entryRefs,blockingRefs=upvalues(enter),upvalues(blocking)
+    if not entryRefs then return nil end
+    local api,picker,input=entryRefs[4],entryRefs[5],entryRefs[7]
+    local screen=rawget(menu,"screen")
+    if type(api)~="table" or rawget(api,"enter")~=native
+        or typeof(screen)~="Instance" or not screen:IsA("ScreenGui") or screen.Name~="MenuGui" or screen.Parent~=playerGui
+        or typeof(picker)~="Instance" or not picker:IsA("GuiObject") or picker.Parent~=screen
+        or not captures(blockingRefs,picker)
+        or typeof(input)~="Instance" or not input:IsA("TextBox") or not input:IsDescendantOf(picker) then return nil end
+
+    return enter,menu,module,picker,input,screen
+end
+-- END AGGREGATE MENU
     local function menuEntry(b)
+        if b and b.observation then return aggregateMenuEntry(b) end
         if not compatibility.context(b) then return nil end
         local module=b.gameGui:FindFirstChild("WorldMenu")
         local door=rawget(b.state,"useDoor")
@@ -3630,6 +3824,11 @@ do
         if not b then return nil end
         local c=b.worldReturnSurface
         local function valid()
+            if c and b.observation then
+                local enter,menu,module,picker,input,screen=aggregateMenuEntry(b)
+                return enter==c.enter and menu==c.menu and module==c.module and picker==c.picker
+                    and input==c.input and screen==c.screen and rawget(menu,"blocking")==c.blocking
+            end
             return c and (c.module.Parent==b.gameGui or b.runtime and c.module.Parent==nil) and compatibility.context(b)
                 and rawget(c.menu,"enter")==c.enter and rawget(c.menu,"blocking")==c.blocking
                 and ownerMatches(c.enter,c.module) and ownerMatches(c.blocking,c.module)
@@ -3861,6 +4060,7 @@ function worldStartup.menuBinding(b)
     if not gui then return nil end
     -- Initial world selection has no dimensions, inventory, or active position yet.
     local context=compatibility.renderer(gui,true)
+    if not context and compatibility.aggregate then context=compatibility.aggregateData(compatibility.aggregate) end
     worldStartup.menuContext=context
     return context
 end
@@ -3868,7 +4068,9 @@ local function joinAtDoor(context,enter,world,door)
     local state=context.state
     local native=rawget(state,"enter")
     local values=upvalues(native)
-    if not ownedArity(native,context.controller,2) or not values or values[1]~=state
+    local outer=context.observation and context.observation.state
+    local owner=outer and functionOwner(native) or context.controller
+    if not ownedArity(native,owner,2) or not values or values[1]~=(outer or state)
         or not hasConstants(native,{"arriveDoor","InvokeServer","arrive","teleport","setWorld"}) then
         return false,"Door entry is unavailable in this game version."
     end
@@ -4109,8 +4311,12 @@ do
             local state=b.state
             local use=rawget(state,"useDoor")
             local values=upvalues(use)
-            if not ownedArity(use,b.controller,4) or not values or values[1]~=state
-                or not hasConstants(use,{"doors","get","areas","mayBuild","doorZoom"}) then
+            local outer=b.observation and b.observation.state
+            local owner=outer and functionOwner(use) or b.controller
+            local markers=outer and {"px","py","world","fg","areas","mayBuild","doorZoom"}
+                or {"doors","get","areas","mayBuild","doorZoom"}
+            if not ownedArity(use,owner,4) or not values or values[1]~=(outer or state)
+                or not hasConstants(use,markers) then
                 fail(trip,"Native door interaction is unavailable.");return true
             end
             if rawget(state,"doorZoom") or (lease.outstanding or 0)>0 then return true end
@@ -4214,6 +4420,10 @@ function worldStartup.tick()
     end
     if running or farm or pending then return false end
     local b=bind(false)
+    if not b and compatibility.aggregatePosition() then
+        s.status="World detected. Farm actions are unavailable on this game version."
+        return s.farmWanted or s.autoJoin
+    end
     local context=s.menuBinding(b)
     local shown,enter=worldReturn.surface(context)
     local target,worldName,door=s.destination(s.targetWorld)
@@ -4257,6 +4467,10 @@ function worldStartup.tick()
         s.attempts=(s.attempts or 0)+1
         s.nextAttempt=now+math.min(15,3+s.attempts*2)
         beginJoin(s,context,enter,target,worldName,door)
+        return true
+    end
+    if b and b.observation and s.farmWanted then
+        s.status="World detected. Farm actions are unavailable on this game version."
         return true
     end
     if shown==nil and s.farmWanted and not s.manualStart then
@@ -4364,7 +4578,7 @@ onAction(runButton,function()
         or not finite(interval) or interval<.05 or interval>5 then
         log("Item ID > 0, Pukul 1-50, Jeda 0.05-5 detik.");report(true);return
     end
-    local b,x,y,world=canStart()
+    local b,x,y,world=canStart("stationary")
     if not b then log(x);report(true);return end
     local count=inventoryNumber(b,"count",id)
     if not count or count<=0 then log("Item PNB habis atau inventory belum terbaca.");report(true);return end
@@ -4376,7 +4590,13 @@ onAction(runButton,function()
         log("Target PNB di luar world/ukuran world belum terbaca.");report(true);return
     end
     local native,why
-    if b.netCall then
+    if b.observation then
+        if not compatibility.aggregatePickup(b) then
+            log("The v1945 pickup and inventory contracts could not be verified.");report(true);return
+        end
+        native,why=compatibility.aggregateFarm(b,"stationary")
+        if not native then log(why);report(true);return end
+    elseif b.netCall then
         native,why=farmBinding(b)
         if not native then log(why);report(true);return end
     end
@@ -16819,6 +17039,13 @@ return RayfieldLibrary
         worldStartup.setFarm(value);ui.Sync(true);report(true)
     end})
     local summary=main:CreateParagraph({Title="Farm Status",Content="Idle"})
+    local initialBinding=bind(false)
+    if initialBinding and initialBinding.observation then
+        main:CreateButton({Name="Stationary PNB",Callback=function()
+            dispatch("Run")
+            if type(library.Notify)=="function" then library:Notify({Title="Stationary PNB",Content=result,Duration=4}) end
+        end})
+    end
     main:CreateParagraph({Title="Cycle Overview",Content="Place and break with auto collect, then plant and harvest supported tiles from the top row, left to right. A full stack of 200 blocks starts PNB. At 200 seeds, store 100 in Display Box 1422. If the world menu opens, return to the same farm world and resume. "..(nativeUI and "Tap Hide to collapse GenHub." or "Right Ctrl toggles the window.")})
     main:CreateButton({Name="Close",Callback=function() dispatch("Close") end})
     local inputMirrors={}
