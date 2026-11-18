@@ -11,6 +11,7 @@ do
     local globalBan=source.autoban
     if globalBan==nil then globalBan=source.autoBan end
     local globalWhitelist=source.whitelist or source.Whitelist
+    local globalWebhook=source.webhook or source.Webhook -- URL Discord webhook untuk notifikasi ban
     GENHUB_CONFIG={
         headless=true,                              -- true  = tanpa GUI (hanya layar hitam + status)
                                                     -- false = GUI Rayfield ditampilkan lagi
@@ -18,7 +19,7 @@ do
             transparency=0.5,                      -- kegelapan layar status: 0 = hitam pekat, 1 = bening
             textSize=18,                            -- ukuran MAKSIMAL tulisan status; kalau teks panjang otomatis mengecil agar semua muat
         },
-        autoban=globalBan,whitelist=globalWhitelist,users=source.users,                         -- config per username, diisi dari getgenv().GENHUB_GROWBLOX
+        autoban=globalBan,whitelist=globalWhitelist,webhook=globalWebhook,users=source.users,                         -- config per username, diisi dari getgenv().GENHUB_GROWBLOX
     }
 end;
 (function()
@@ -32,7 +33,7 @@ local CONFIG = { range=3, interval=0.06, retrySeconds=5, rpcTimeout=5, scanLimit
     flow=true,flowBatch=8,airSkip=true,airSkipMax=5 } -- PATCH FLOW: flow=false mengembalikan perilaku lama (verifikasi per tile); speed=5 = setelan khas kaitun
 CONFIG.seedDrop=150
 CONFIG.taken={} -- PATCH: uid -> {id,orig,taken}. Drop yang sudah DITERIMA server tidak boleh dihitung/diminta lagi.
-CONFIG.autoban=GENHUB_CONFIG.autoban;CONFIG.whitelist=GENHUB_CONFIG.whitelist;CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
+CONFIG.autoban=GENHUB_CONFIG.autoban;CONFIG.webhook=GENHUB_CONFIG.webhook;CONFIG.whitelist=GENHUB_CONFIG.whitelist;CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -5584,6 +5585,37 @@ do
             local nb=rawget(rec,"nameBox")
             return strField(rec) or strField(nb) or shortString(rec) or shortString(nb) or instText(nb)
         end
+        -- ===== WEBHOOK BAN: kirim info ke Discord setelah /ban terkirim (sekali per pemain, tidak spam saat retry) =====
+        local notified={}
+        local function notifyBan(target,attempt,worldName)
+            local url=CONFIG.webhook
+            if type(url)~="string" or not url:match("^https://[%w%.]*discord%.com/api/webhooks/") and not url:match("^https://[%w%.]*discordapp%.com/api/webhooks/") then return end
+            task.spawn(function()
+                pcall(function()
+                    local req=(syn and syn.request) or http_request or request or (http and http.request) or (fluxus and fluxus.request)
+                    if type(req)~="function" then log("Webhook: fungsi request executor tidak tersedia");return end
+                    local me=game:GetService("Players").LocalPlayer
+                    local body=game:GetService("HttpService"):JSONEncode({
+                        username="GenHub AutoBan",
+                        allowed_mentions={parse={}},
+                        embeds={{
+                            title="Auto Ban",
+                            color=15158332,
+                            fields={
+                                {name="Di-ban",value=tostring(target),inline=true},
+                                {name="Oleh akun",value=me and me.Name or "?",inline=true},
+                                {name="World",value=tostring(worldName or "?"),inline=true},
+                                {name="Percobaan",value=tostring(attempt),inline=true},
+                            },
+                            timestamp=os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                        }},
+                    })
+                    local res=req({Url=url,Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
+                    local code=res and (res.StatusCode or res.status_code)
+                    if code and (code<200 or code>=300) then log("Webhook gagal, status "..tostring(code)) end
+                end)
+            end)
+        end
         local tried={}
         local updateFn,registry=nil,nil
         local lastResolve,lastGc,lastErr=0,-math.huge,nil
@@ -5595,6 +5627,7 @@ do
                     if #ban.list==0 then ban.status="Whitelist kosong: auto ban ditahan (isi minimal 1 nama)";return end
                     if rp.warp then ban.status="Menunggu warp selesai";return end
                     local _,_,world=positionSnapshot()
+                    if world and rp.saveWorld and name(world)==name(rp.saveWorld) then tried={};ban.status="Aktif, di World Save: ban ditahan";return end -- FIX: jangan ban di world save
                     if not (world and (not rp.farmWorld or rp.farmWorld=="" or name(world)==name(rp.farmWorld))) then -- FIX: Farm World kosong = ban di world yang sedang dimasuki
                         tried={};ban.status="Aktif, menunggu di world farm";return
                     end
@@ -5610,6 +5643,7 @@ do
                         end
                     end
                     for k in pairs(tried) do if not present[k] then tried[k]=nil end end
+                    for k in pairs(notified) do if not present[k] then notified[k]=nil end end
                     ban.status=string.format("Aktif | pemain lain: %d%s",#order,ban.last and (" | ban terakhir: "..ban.last) or "")
                     for _,n in ipairs(order) do
                         local k=norm(n)
@@ -5621,6 +5655,7 @@ do
                                 tried[k]={count=count,at=os.clock()}
                                 ban.last=n
                                 log(string.format("AutoBan: /ban %s (percobaan %d): %s",n,count,ok and "terkirim" or tostring(why)))
+                                if ok and not notified[k] then notified[k]=true;notifyBan(n,count,name(world)) end
                                 break
                             end
                         end
@@ -5633,6 +5668,7 @@ do
         if CONFIG.autoban~=nil or type(CONFIG.whitelist)=="table" then
             ban.enabled=CONFIG.autoban==true
             if type(CONFIG.whitelist)=="table" then for _,n in ipairs(CONFIG.whitelist) do ban.add(n) end end
+            if type(CONFIG.users)=="table" then for k in pairs(CONFIG.users) do if type(k)=="string" and k~="*" then ban.add(k) end end end -- FIX: akun sendiri tidak di-ban
         end
     end)() end
     function rp.shouldDepart(a,world)
