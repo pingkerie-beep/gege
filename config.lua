@@ -7,6 +7,7 @@ getgenv().GENHUB_GROWBLOX={
     ---------------------------------------------------------------------------
     autoban   = true,
     whitelist = {"namaingame1", "namaingame2"},
+    webhook   = "",   -- URL Discord webhook; info pemain yang di-ban dikirim ke sini ("" = nonaktif)
     ---------------------------------------------------------------------------
     users={
         ["username"]={
