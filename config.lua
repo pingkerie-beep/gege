@@ -5,6 +5,9 @@ getgenv().GENHUB_GROWBLOX={
     -- Semua isi bersifat opsional; yang tidak ditulis memakai nilai default.
     -- Semua pengaturan dibaca dari tabel ini, bukan dari file .json.
     ---------------------------------------------------------------------------
+    autoban   = true,
+    whitelist = {"namaingame1", "namaingame2"},
+    ---------------------------------------------------------------------------
     users={
         ["username"]={
             -- ===== MODE UTAMA =====
