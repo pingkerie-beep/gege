@@ -8,14 +8,17 @@ do
     local okEnv,genv=pcall(function() return getgenv() end)
     local source=(okEnv and type(genv)=="table" and genv.GENHUB_GROWBLOX) or rawget(_G,"GENHUB_GROWBLOX")
     assert(type(source)=="table","GENHUB_GROWBLOX belum diisi. Isi getgenv().GENHUB_GROWBLOX={...} sebelum loadstring.")
+    local globalBan=source.autoban
+    if globalBan==nil then globalBan=source.autoBan end
+    local globalWhitelist=source.whitelist or source.Whitelist
     GENHUB_CONFIG={
         headless=true,                              -- true  = tanpa GUI (hanya layar hitam + status)
                                                     -- false = GUI Rayfield ditampilkan lagi
         overlay={
-            transparency=0.1,                      -- kegelapan layar status: 0 = hitam pekat, 1 = bening
+            transparency=0.5,                      -- kegelapan layar status: 0 = hitam pekat, 1 = bening
             textSize=18,                            -- ukuran MAKSIMAL tulisan status; kalau teks panjang otomatis mengecil agar semua muat
         },
-        users=source.users,                         -- config per username, diisi dari getgenv().GENHUB_GROWBLOX
+        autoban=globalBan,whitelist=globalWhitelist,users=source.users,                         -- config per username, diisi dari getgenv().GENHUB_GROWBLOX
     }
 end;
 (function()
@@ -29,7 +32,7 @@ local CONFIG = { range=3, interval=0.06, retrySeconds=5, rpcTimeout=5, scanLimit
     flow=true,flowBatch=8,airSkip=true,airSkipMax=5 } -- PATCH FLOW: flow=false mengembalikan perilaku lama (verifikasi per tile); speed=5 = setelan khas kaitun
 CONFIG.seedDrop=150
 CONFIG.taken={} -- PATCH: uid -> {id,orig,taken}. Drop yang sudah DITERIMA server tidak boleh dihitung/diminta lagi.
-CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
+CONFIG.autoban=GENHUB_CONFIG.autoban;CONFIG.whitelist=GENHUB_CONFIG.whitelist;CONFIG.users=GENHUB_CONFIG.users;CONFIG.overlay=GENHUB_CONFIG.overlay;CONFIG.headless=GENHUB_CONFIG.headless
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -5370,9 +5373,14 @@ do
     end
     local function chatCandidates()
         local gui=playerGui:FindFirstChild("GameGui")
+        local chatGui=playerGui:FindFirstChild("ChatGui") -- FIX: chat sekarang ada di PlayerGui.ChatGui, bukan hanya GameGui
         local best,all={},{}
-        if not gui then return best,all end
-        for _,d in ipairs(gui:GetDescendants()) do
+        if not gui and not chatGui then return best,all end
+        local pool={}
+        for _,root in ipairs({gui or false,chatGui or false}) do
+            if root then for _,inst in ipairs(root:GetDescendants()) do pool[#pool+1]=inst end end
+        end
+        for _,d in ipairs(pool) do
             if d:IsA("TextBox") then
                 local full=d:GetFullName()
                 local low=full:lower()
@@ -5386,7 +5394,7 @@ do
         end
         table.sort(best,function(a,b) return (read(a,"Visible")==true and 0 or 1)<(read(b,"Visible")==true and 0 or 1) end)
         for _,d in ipairs(playerGui:GetDescendants()) do
-            if d:IsA("TextBox") and not d:IsDescendantOf(gui) then
+            if d:IsA("TextBox") and not (gui and d:IsDescendantOf(gui)) and not (chatGui and d:IsDescendantOf(chatGui)) then
                 table.insert(all,string.format("[luar GameGui] %s | placeholder=%s | visible=%s",d:GetFullName(),tostring(read(d,"PlaceholderText") or ""),tostring(read(d,"Visible"))))
             end
         end
@@ -5475,6 +5483,158 @@ do
             end
         end
     end
+    -- ===== AUTO BAN (GenHub): /ban pemain di world farm yang TIDAK ada di whitelist (pakai NAMA IN-GAME) =====
+    rp.ban={enabled=false,list={},status="OFF",last=nil}
+    do (function() -- FIX: bungkus fungsi sendiri agar tidak melewati batas 200 local register
+        local ban=rp.ban
+        local NAME_KEYS={"name","nick","nickname","username","displayName","display","n","label","text","str"}
+        local function norm(s) return (tostring(s or ""):lower():gsub("[^%w]","")) end
+        ban.norm=norm
+        function ban.has(n) local k=norm(n);for _,v in ipairs(ban.list) do if norm(v)==k then return true end end return false end
+        function ban.add(n)
+            n=tostring(n or ""):match("^%s*(.-)%s*$")
+            if n=="" or #n>32 or #ban.list>=50 or ban.has(n) then return false end
+            table.insert(ban.list,n);return true
+        end
+        function ban.remove(n)
+            local k=norm(n)
+            for i=#ban.list,1,-1 do if norm(ban.list[i])==k then table.remove(ban.list,i);return true end end
+            return false
+        end
+        local function consts(fn) local ok,c=pcall(debug.getconstants,fn);return (ok and type(c)=="table") and c or {} end
+        local function ups(fn) local ok,v=pcall(debug.getupvalues,fn);return (ok and type(v)=="table") and v or {} end
+        local function hasAll(fn,wanted)
+            local set={}
+            for _,v in pairs(consts(fn)) do set[tostring(v)]=true end
+            for _,w in ipairs(wanted) do if not set[w] then return false end end
+            return true
+        end
+        local function findOthersUpdate()
+            if type(getgc)~="function" then return nil end
+            local ok,gc=pcall(getgc,true)
+            if not ok or type(gc)~="table" then return nil end
+            for _,v in ipairs(gc) do
+                if type(v)=="table" then
+                    local okr,u=pcall(rawget,v,"update")
+                    if okr and type(u)=="function" and type(rawget(v,"sendHit"))=="function" and hasAll(u,{"seen","group","nameBox"}) then return u end
+                end
+            end
+            return nil
+        end
+        local function looksLikeRec(v) return type(v)=="table" and (rawget(v,"nameBox")~=nil or rawget(v,"seen")~=nil) end
+        local function findRegistry(updateFn)
+            local visited={}
+            local function check(t)
+                local n=0
+                for _,v in pairs(t) do n+=1;if n>200 then break end if looksLikeRec(v) then return true end end
+                return false
+            end
+            local function walk(t,depth)
+                if visited[t] then return nil end
+                visited[t]=true
+                if check(t) then return t end
+                if depth>=2 then return nil end
+                local n=0
+                for _,v in pairs(t) do
+                    n+=1;if n>200 then break end
+                    if type(v)=="table" then local r=walk(v,depth+1);if r then return r end end
+                end
+                return nil
+            end
+            for _,v in pairs(ups(updateFn)) do
+                if type(v)=="table" then local r=walk(v,0);if r then return r end end
+            end
+            for _,f in pairs(ups(updateFn)) do
+                if type(f)=="function" then
+                    for _,w in pairs(ups(f)) do
+                        if type(w)=="table" then local r=walk(w,0);if r then return r end end
+                    end
+                end
+            end
+            return nil
+        end
+        local function strField(t)
+            if type(t)~="table" then return nil end
+            for _,k in ipairs(NAME_KEYS) do
+                local v=rawget(t,k)
+                if type(v)=="string" and v~="" then return v end
+            end
+            return nil
+        end
+        local function shortString(t)
+            if type(t)~="table" then return nil end
+            for _,v in pairs(t) do
+                if type(v)=="string" and #v>=2 and #v<=24 and not v:match("^%d+$") then return v end
+            end
+            return nil
+        end
+        local function instText(inst)
+            if typeof(inst)~="Instance" then return nil end
+            local ok,text=pcall(function()
+                if inst:IsA("TextLabel") or inst:IsA("TextBox") then return inst.Text end
+                for _,d in ipairs(inst:GetDescendants()) do
+                    if (d:IsA("TextLabel") or d:IsA("TextBox")) and d.Text~="" then return d.Text end
+                end
+                return nil
+            end)
+            if ok and type(text)=="string" and text~="" then return text end
+            return nil
+        end
+        local function recName(rec)
+            local nb=rawget(rec,"nameBox")
+            return strField(rec) or strField(nb) or shortString(rec) or shortString(nb) or instText(nb)
+        end
+        local tried={}
+        local updateFn,registry=nil,nil
+        local lastResolve,lastGc,lastErr=0,-math.huge,nil
+        task.spawn(function()
+            while alive and not rp.shutdown do
+                task.wait(1.5)
+                local okTick,err=pcall(function()
+                    if not ban.enabled then ban.status="OFF";return end
+                    if #ban.list==0 then ban.status="Whitelist kosong: auto ban ditahan (isi minimal 1 nama)";return end
+                    if rp.warp then ban.status="Menunggu warp selesai";return end
+                    local _,_,world=positionSnapshot()
+                    if not (world and (not rp.farmWorld or rp.farmWorld=="" or name(world)==name(rp.farmWorld))) then -- FIX: Farm World kosong = ban di world yang sedang dimasuki
+                        tried={};ban.status="Aktif, menunggu di world farm";return
+                    end
+                    if not updateFn and os.clock()-lastGc>10 then lastGc=os.clock();updateFn=findOthersUpdate() end
+                    if not updateFn then ban.status="Aktif, modul pemain belum ketemu";return end
+                    if not registry or os.clock()-lastResolve>5 then registry=findRegistry(updateFn) or registry;lastResolve=os.clock() end
+                    if not registry then ban.status="Aktif, daftar pemain belum ketemu";return end
+                    local present,order={},{}
+                    for _,rec in pairs(registry) do
+                        if looksLikeRec(rec) then
+                            local n=recName(rec)
+                            if n then present[norm(n)]=true;table.insert(order,n) end
+                        end
+                    end
+                    for k in pairs(tried) do if not present[k] then tried[k]=nil end end
+                    ban.status=string.format("Aktif | pemain lain: %d%s",#order,ban.last and (" | ban terakhir: "..ban.last) or "")
+                    for _,n in ipairs(order) do
+                        local k=norm(n)
+                        if k~="" and not ban.has(n) then
+                            local t=tried[k]
+                            if not t or (t.count<4 and os.clock()-t.at>=12) then
+                                local count=(t and t.count or 0)+1
+                                local ok,why=sendChat("/ban "..n,count%2==0)
+                                tried[k]={count=count,at=os.clock()}
+                                ban.last=n
+                                log(string.format("AutoBan: /ban %s (percobaan %d): %s",n,count,ok and "terkirim" or tostring(why)))
+                                break
+                            end
+                        end
+                    end
+                end)
+                if not okTick and tostring(err)~=lastErr then lastErr=tostring(err);log("AutoBan error: "..lastErr:sub(1,160)) end
+            end
+        end)
+        -- Config global (kaitun): GENHUB_GROWBLOX.autoban + whitelist menimpa setelan per-akun.
+        if CONFIG.autoban~=nil or type(CONFIG.whitelist)=="table" then
+            ban.enabled=CONFIG.autoban==true
+            if type(CONFIG.whitelist)=="table" then for _,n in ipairs(CONFIG.whitelist) do ban.add(n) end end
+        end
+    end)() end
     function rp.shouldDepart(a,world)
         if not rp.enabled or a.visit or a.warp or a.pnbOnly or a.harvestOnly or rp.warp then return false end
         if not rp.farmWorld or name(world)~=name(rp.farmWorld) then return false end
@@ -18019,6 +18179,18 @@ return RayfieldLibrary
         end
         return count>0 and count<=32 and text or nil
     end
+    local function sanitizeBan(list)
+        local out={}
+        if type(list)=="table" then
+            for _,v in ipairs(list) do
+                if type(v)=="string" and #out<50 then
+                    local s=v:match("^%s*(.-)%s*$")
+                    if s~="" and #s<=32 then table.insert(out,s) end
+                end
+            end
+        end
+        return out
+    end
     local function validate(data)
         if type(data)~="table" or data.version~=1 or type(data.autoLoad)~="boolean" then return nil,"Invalid configuration format." end
         if not integer(data.targetId) or not ui.byId[data.targetId] or not pair(ui.db,data.targetId) then return nil,"The saved target is not available in this game." end
@@ -18045,7 +18217,7 @@ return RayfieldLibrary
         return {version=1,autoLoad=data.autoLoad,targetId=data.targetId,pnbId=pnbId,hits=data.hits,delay=data.delay,range=data.range,collectFilter=filter,
             soundEffects=data.soundEffects~=false,handAnimations=data.handAnimations~=false,blockEffects=data.blockEffects~=false,uiScale=scale,
             fpsBoost=data.fpsBoost~=false,render3dOff=data.render3dOff~=false,depositId=data.depositId or 1422,
-            farmOn=data.farmOn==true,pnbOn=data.pnbOn==true,pnbDrop=data.pnbDrop~=false,hideUsername=data.hideUsername==true,
+            farmOn=data.farmOn==true,pnbOn=data.pnbOn==true,pnbDrop=data.pnbDrop~=false,hideUsername=data.hideUsername==true,autoBan=data.autoBan==true,banWhitelist=sanitizeBan(data.banWhitelist),
             randomPnb=data.randomPnb==true,takeSeed=data.takeSeed==true,takeNext=(type(data.takeNext)=="number" and data.takeNext==data.takeNext) and data.takeNext or 0,
             farmWorld=type(data.farmWorld)=="string" and rp.name(data.farmWorld) or nil,
             buyWL=data.buyWL==true,dontPlant=data.dontPlant==true,
@@ -18066,7 +18238,7 @@ return RayfieldLibrary
     local function currentConfig()
         return validate({version=1,autoLoad=ui.autoLoad,targetId=tonumber(idInput.Text),pnbId=ui.pnbId,hits=tonumber(hitsInput.Text),
             delay=tonumber(delayInput.Text),range=tonumber(rangeInput.Text),collectFilter=filterInput.Text,
-            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername,
+            soundEffects=effects.sounds,handAnimations=effects.hands,blockEffects=effects.blocks,uiScale=ui.uiScale,hideUsername=ui.hideUsername,autoBan=rp.ban.enabled==true,banWhitelist=rp.ban.list,
             fpsBoost=boost.lite,render3dOff=boost.render3d,depositId=rp.depositId,pnbDrop=rp.pnbDrop~=false,
             farmOn=(autoLoop~=nil and (not autoLoop.pnbOnly or autoLoop.visit==true)) or rp.keepOn==true,
         pnbOn=autoLoop~=nil and autoLoop.pnbOnly==true and not autoLoop.visit,
@@ -18469,6 +18641,44 @@ return RayfieldLibrary
         ui.Sync(true)
     end})
     settingsTab:CreateButton({Name="Save Config",Callback=function() ui.SaveConfig(false) end})
+    do
+    settingsTab:CreateSection("Auto Ban")
+    local banToggle=settingsTab:CreateToggle({Name="Auto Ban (non-whitelist)",CurrentValue=rp.ban.enabled==true,Callback=function(value)
+        if ui.updating then return end
+        rp.ban.enabled=value==true
+        ui.SaveConfig(true);ui.SyncBan(true)
+    end})
+    local banInput=""
+    settingsTab:CreateInput({Name="Nama in-game",CurrentValue="",PlaceholderText="nama in-game (boleh pisah koma)",RemoveTextAfterFocusLost=false,Callback=function(value)
+        banInput=tostring(value or "")
+    end})
+    settingsTab:CreateButton({Name="Add ke Whitelist",Callback=function()
+        local added=0
+        for part in banInput:gmatch("[^,]+") do if rp.ban.add(part) then added+=1 end end
+        notify(added>0 and (added.." nama ditambahkan ke whitelist.") or "Tidak ada nama baru (kosong, duplikat, atau whitelist penuh).")
+        ui.SaveConfig(true);ui.SyncBan(true)
+    end})
+    settingsTab:CreateButton({Name="Remove dari Whitelist",Callback=function()
+        local removed=0
+        for part in banInput:gmatch("[^,]+") do if rp.ban.remove(part) then removed+=1 end end
+        notify(removed>0 and (removed.." nama dihapus dari whitelist.") or "Nama tidak ada di whitelist.")
+        ui.SaveConfig(true);ui.SyncBan(true)
+    end})
+    local banInfo=settingsTab:CreateParagraph({Title="Whitelist (0)",Content="(kosong)"})
+    local banShown=nil
+    function ui.SyncBan(force)
+        if banToggle.CurrentValue~=(rp.ban.enabled==true) then
+            local previous=ui.updating;ui.updating=true
+            pcall(function() banToggle:Set(rp.ban.enabled==true) end)
+            ui.updating=previous
+        end
+        local content=(#rp.ban.list>0 and table.concat(rp.ban.list,", ") or "(kosong)").."\n"..tostring(rp.ban.status)
+        if force or content~=banShown then
+            banShown=content
+            paragraph(banInfo,"Whitelist ("..#rp.ban.list..")",content)
+        end
+    end
+    end
     settingsTab:CreateParagraph({Title="Saved Settings",Content="Saves the farmable target, PNB and collection settings, Harvest settings (block, worlds, drop patokan, Drop Seed), effects, preferred UI size, and Hide Username. Auto Load restores them next time, including resuming Harvest if it was on. Changing Auto Load also saves your current settings. Turn on Start Farm when ready; turn it off to stop."})
     local detail=statusTab:CreateParagraph({Title="Full Status",Content="Ready."})
     function ui.Rebuild()
@@ -18532,6 +18742,7 @@ return RayfieldLibrary
     function ui.Sync(force)
         if not ui.ready or not alive or not force and os.clock()-ui.lastSync<.5 then return end
         ui.lastSync=os.clock()
+        if ui.SyncBan then ui.SyncBan() end
         if ui.hideUsername then ui.usernamePrivacy.Refresh() end
         if binding and binding.itemDB~=ui.db then ui.Rebuild();ui.Search() end
         local row=ui.byId[tonumber(idInput.Text)];ui.selected=row
@@ -18912,6 +19123,7 @@ return RayfieldLibrary
         if quiet and not ui.configLoaded then ui.configStatus=previousStatus end
     end
     ui.LoadConfig(false)
+    if ui.SyncBan then ui.SyncBan(true) end
     library:SetUIScale(ui.uiScale);ui.Sync(true);panel.Visible=false
     -- FIX: nyalakan kembali toggle yang tersimpan. Siklus mulai dari JEDA dan mencoba ulang sendiri sampai game siap.
     function ui.RunPending()
