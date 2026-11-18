@@ -1693,7 +1693,7 @@ end
 local function startPickup(b,cell)
     if farm and farm.motion and (farm.motion.supportStep or farm.motion.transfer) then return end
     if pending or (lease.outstanding or 0)>0 then return end
-    if autoLoop and (autoLoop.paused or autoLoop.job or autoLoop.deposit or autoLoop.stage=="SETOR") then return end
+    if autoLoop and (autoLoop.paused or autoLoop.job or autoLoop.deposit or (autoLoop.stage=="SETOR" and not (autoLoop.takeTrip and not autoLoop.takeTrip.over))) then return end -- PATCH AUTO TAKE SEED: kolek jalan hanya selama trip ambil seed aktif; setelah selesai (menunggu warp balik) kolek mati lagi
     if farm and not farm.preview and (farm.action or farm.job or farm.correction) then return end
     local other=rawget(env,"_GemTargetRPC_v1")
     if type(other)=="table" and (other.outstanding or 0)>0 then return end
@@ -4570,6 +4570,7 @@ do
         local f=farm
         if f then f.target,f.motion=nil,nil end
         if t.range and collectRange and collectRange>t.range then collectRange=t.range end
+        if t.filterSet then collectFilter,filterText=t.oldFilter,t.oldText;t.filterSet=nil end
         local got=seedCount(a)-(t.base or 0)
         rp.takeSeed=false
         rp.phase="farm"
@@ -4584,6 +4585,43 @@ do
         t.fails+=1;retryAt[uid]=os.clock()+60;t.g=nil
         if farm then farm.target,farm.motion=nil,nil end
     end
+    -- Tile berdiri dekat drop, ukuran jarak sama seperti MoveItem: ((ty+.999)-.475) terhadap r.y, diurutkan terdekat dulu.
+    local function standsNear(n,r,range,occ,side)
+        local sx,sy=math.floor(r.x),math.floor(r.y-.001)
+        local reach=math.ceil(range)+1
+        local cells={}
+        for dy=-reach,reach do
+            for dx=-reach,reach do
+                local tx,ty=sx+dx,sy+dy
+                if tx>=0 and tx<n.width and ty>=0 and ty<n.height-2
+                    and not (occ and occ[ty*n.width+tx])
+                    and (not side or side==0 or (tx+.5-r.x)*side>.4) -- berhenti di sisi yang sama dengan karakter, tidak menyeberangi drop
+                    and farmStanding(n,tx+.5,ty+.999) and not farmBoxHits(n,tx+.5,ty+.999) then
+                    local ddx,ddy=(tx+.5)-r.x,((ty+.999)-.475)-r.y
+                    local d=ddx*ddx+ddy*ddy
+                    if d<=range*range then cells[#cells+1]={x=tx,y=ty,key=ty*n.width+tx,kind="recovery",d=d} end
+                end
+            end
+        end
+        table.sort(cells,function(l,r2) return l.d<r2.d end)
+        return cells
+    end
+    -- Rute tidak boleh menginjak/melewati tile berisi drop (seed atau WL), kecuali tile awal karakter.
+    local function routeTouches(route,occ,width,cx,cy)
+        local px,py=cx,cy
+        for _,s in ipairs(route) do
+            local sx2,sy2=s.x,s.y
+            if sx2 and sy2 then
+                if sy2==py then
+                    for tx=math.min(px,sx2),math.max(px,sx2) do
+                        if not (tx==cx and sy2==cy) and occ[sy2*width+tx] then return true end
+                    end
+                elseif not (sx2==cx and sy2==cy) and occ[sy2*width+sx2] then return true end
+                px,py=sx2,sy2
+            end
+        end
+        return false
+    end
     function rp.takeTick(a,x,y)
         local t=a.takeTrip
         if t.over then return end
@@ -4593,7 +4631,12 @@ do
         local n=f.native
         if a.stage~="SETOR" then loopStage(a,"SETOR") end
         a.progressAt=os.clock()
-        if t.base==nil then t.base=seedCount(a);t.range=collectRange end
+        if t.base==nil then
+            t.base=seedCount(a);t.range=collectRange
+            -- Hanya kolek seed target; WL atau item lain di ground World Save jangan ikut terambil.
+            t.oldFilter,t.oldText,t.filterSet=collectFilter,filterText,true
+            collectFilter,filterText={[a.seed]=true},"SEED "..tostring(a.seed)
+        end
         local have=seedCount(a)
         local g=t.g
         if g then
@@ -4609,7 +4652,7 @@ do
                 elseif os.clock()-g.at>20 then failDrop(t,g.uid)
                 else
                     local route=farmPlan(f,s,x,y)
-                    if route then f.target,f.motion=s,route else failDrop(t,g.uid) end
+                    if route and not routeTouches(route,t.occ or {},n.width,math.floor(x),math.floor(y-.001)) then f.target,f.motion=s,route else failDrop(t,g.uid) end
                 end
                 return
             end
@@ -4622,11 +4665,14 @@ do
         if t.fails>=4 then endTake(a,have>t.base and "sebagian terambil" or "gagal mengambil drop");return end
         if have>=TAKE_MAX then endTake(a,"seed penuh");return end
         local list=records(n.b)
-        local found,scanned={},0
+        local found,scanned,occ={},0,{}
         for _,r in next,(list or {}) do
             scanned+=1;if scanned>CONFIG.scanLimit then break end
-            if worldDrop(n.b,r) and r.id==a.seed and (retryAt[r.uid] or 0)<=os.clock() and have+r.n<=TAKE_MAX then
-                found[#found+1]={record=r,uid=r.uid,d=(r.x-x)^2+(r.y-(y-.475))^2}
+            if worldDrop(n.b,r) then
+                occ[math.floor(r.y)*n.width+math.floor(r.x)]=true -- tile berisi drop (seed/WL/lainnya): jangan dipijak
+                if r.id==a.seed and (retryAt[r.uid] or 0)<=os.clock() and have+r.n<=TAKE_MAX then
+                    found[#found+1]={record=r,uid=r.uid,d=(r.x-x)^2+(r.y-(y-.475))^2}
+                end
             end
         end
         if #found==0 then
@@ -4637,7 +4683,8 @@ do
         local needs=math.max(collectRange or CONFIG.range,3)
         if (collectRange or 0)<needs then collectRange=needs end
         -- Drop terdekat sudah dalam jangkauan: langsung kolek tanpa pindah.
-        if found[1].d<=(needs-1)^2 then
+        local cx,cy=math.floor(x),math.floor(y-.001)
+        if found[1].d<=1.6^2 and not occ[cy*n.width+cx] then
             t.g={phase="collect",at=os.clock(),uid=found[1].uid,have=have}
             denied[found[1].uid]=nil;retryAt[found[1].uid]=nil;nextCollect=0
             farmNote="AMBIL SEED: mengambil drop seed di dekat posisi."
@@ -4646,10 +4693,12 @@ do
         local attempts=0
         for i=1,math.min(#found,8) do
             local r=found[i].record
-            for _,s in ipairs(findBlockStand(n,r.x,r.y,needs)) do
+            local side=(x-r.x>.3) and 1 or (x-r.x<-.3) and -1 or 0
+            for _,s in ipairs(standsNear(n,r,2.5,occ,side)) do
                 attempts+=1;if attempts>12 then break end
                 local route=farmPlan(f,s,x,y)
-                if route then
+                if route and not routeTouches(route,occ,n.width,cx,cy) then
+                    t.occ=occ
                     t.g={phase="go",stand=s,at=os.clock(),uid=r.uid}
                     f.target,f.motion=s,route
                     farmNote=string.format("AMBIL SEED: menuju drop seed di (%d,%d).",math.floor(r.x),math.floor(r.y))
