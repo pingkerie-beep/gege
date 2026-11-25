@@ -5,11 +5,12 @@ local source = [========[
 -- Auto Kirim  : kalau lagi pegang ayam, teleport ke NPC farmer (dicari lewat teks "Bring turkeys here" / Highlight, tanpa nama)
 -- Kaitun      : Auto Grab + Auto Kirim ON; pindah server setelah semua ayam kecil habis dikirim.
 -- Pindah Server: otomatis saat kosong, atau lewat tombol untuk pindah manual.
--- Auto Masuk : tunggu UI siap, Continue, I agree, tutup acara, lalu keluar dari kursi.
+-- Auto Masuk : Continue -> cek ayam (kosong = langsung pindah server) -> I agree -> lompat & farming.
+--              Pop-up acara tidak ditunggu; kalau muncul sesudah agree, ditutup di background.
 -- Butuh executor dengan fireproximityprompt (fallback: InputHoldBegin).
 
 local SCRIPT_SOURCE = ...
-local SCRIPT_VERSION = "4.7-kaitun"
+local SCRIPT_VERSION = "5.0-kaitun"
 print("[TurkeyAuto " .. SCRIPT_VERSION .. "/BOOT] skrip mulai")
 
 local Players = game:GetService("Players")
@@ -385,6 +386,17 @@ local lastJoinMessage, lastClickTarget, lastClickAt = "", nil, 0
 local lastClickReason
 local lastJoinError
 local joinIntroHandled = false
+-- masuk dianggap selesai begitu "I agree" beres + karakter berdiri; pop-up acara TIDAK ditunggu
+-- (kalau muncul belakangan, ditutup sambil farming jalan).
+local joinDone, joinDoneAt = false, 0
+local SETTLE_AFTER_JOIN = 1 -- detik, cuma dipakai kalau ayam sudah ada saat agree
+local PRECHECK_SETTLE = 1.2 -- detik setelah Continue sebelum cek ayam
+local joinContinued, joinContinuedAt, joinAgreed, rulesSeen, eventOpen = false, 0, false, false, false
+local agreeMissing = 0 -- hitungan scan berturut-turut tanpa tombol agree (anti salah deteksi sesaat)
+-- true selama sudah lewat Continue tapi belum klik I agree
+local function joinPrecheck()
+	return joinBusy and joinContinued and not joinAgreed and not joinDone and autoJoinEnabled
+end
 local bootstrapStarted = os.clock()
 local lastBootstrapClick, bootstrapClicks = -math.huge, 0
 local virtualInput, virtualInputManager
@@ -1042,6 +1054,8 @@ local function dumpJoinUI()
 			character and character:GetFullName() or "nil", humanoid and humanoid:GetFullName() or "nil",
 			humanoid and tostring(humanoid.Sit) or "nil", humanoid and tostring(humanoid.SeatPart) or "nil",
 			tostring(virtualInput ~= nil), tostring(virtualInputManager ~= nil)),
+		string.format("state: continued=%s | agreed=%s | rulesSeen=%s | done=%s | eventOpen=%s",
+			tostring(joinContinued), tostring(joinAgreed), tostring(rulesSeen), tostring(joinDone), tostring(eventOpen)),
 	}
 	local engineOK, engineVersion = pcall(function() return version() end)
 	if engineOK then table.insert(lines, "engine=" .. tostring(engineVersion)) end
@@ -1174,8 +1188,22 @@ local function processJoin()
 	if not autoJoinEnabled or hopBusy then return end
 	attachGui()
 	local ui = scanJoinUI()
+	eventOpen = ui.event ~= nil
+
+	-- Tombol agree hilang setelah pernah terlihat = sudah diklik. Butuh 2 scan berturut-turut
+	-- supaya hilang sesaat (UI redraw) tidak dianggap selesai.
+	if rulesSeen and not joinAgreed then
+		if not ui.agreeTarget and not ui.rules then
+			agreeMissing += 1
+			if agreeMissing >= 2 then joinAgreed = true end
+		else
+			agreeMissing = 0
+		end
+	end
+
 	if ui.event then
-		joinBusy = true
+		-- sebelum agree: pop-up menghalangi klik, jadi tutup dulu. Sesudah agree: background saja.
+		if not joinAgreed and not joinDone then joinBusy = true end
 		joinIntroHandled = true
 		joinEventSeen, joinAwaitingEvent, joinConfirmation = true, false, nil
 		joinBtn.Text = "Auto Masuk: ON"
@@ -1187,9 +1215,11 @@ local function processJoin()
 		else
 			joinMessage("tombol X acara belum siap, cek Dump UI Masuk atau tutup manual")
 		end
-		return
+		if not (joinAgreed or joinDone) then return end
+	else
+		observeEvent(nil)
 	end
-	observeEvent(nil)
+
 	if ui.continueTarget then
 		joinBusy = true
 		joinAwaitingRules = true
@@ -1199,10 +1229,14 @@ local function processJoin()
 		joinMessage(reason or "Click to Continue terdeteksi, menunggu UI siap...")
 		return
 	end
+
 	if ui.agreeTarget or ui.rules then
 		joinBusy, joinAwaitingRules = true, false
+		rulesSeen, joinAgreed, agreeMissing = true, false, 0
+		-- Continue sudah lewat: mulai jam precheck ayam (loop farming yang mengecek)
+		if not joinContinued then joinContinued, joinContinuedAt = true, os.clock() end
 		joinIntroHandled = true
-		joinAwaitingEvent = not joinEventSeen
+		joinAwaitingEvent = false -- nggak nunggu pop-up acara; ditutup belakangan kalau muncul
 		joinConfirmation = nil
 		joinBtn.Text = "Auto Masuk: ON"
 		local button = ui.agreeTarget and uiButton(ui.agreeTarget)
@@ -1214,6 +1248,27 @@ local function processJoin()
 		end
 		return
 	end
+
+	-- Layar Continue sudah hilang tapi rules belum muncul: precheck ayam sudah boleh jalan
+	if joinAwaitingRules and not joinContinued then joinContinued, joinContinuedAt = true, os.clock() end
+
+	-- Agree selesai: langsung lompat & farming, pop-up acara diurus di background
+	if joinAgreed and not joinDone then
+		local character = lp and lp.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if humanoid and humanoid.Health > 0 and getHRP() then
+			if humanoid.Sit or humanoid.SeatPart then
+				humanoid.Sit = false
+				humanoid.Jump = true
+				pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+			end
+			joinBusy = false
+			joinDone, joinDoneAt = true, os.clock()
+			joinMessage("agree selesai, langsung farming")
+			return
+		end
+	end
+
 	if ui.loading then
 		joinBusy = true
 		joinMessage("menunggu loading UI selesai...")
@@ -1299,6 +1354,7 @@ local function processJoin()
 		return
 	end
 	joinBusy = false
+	joinDone, joinDoneAt = true, os.clock()
 	joinMessage("masuk selesai, karakter siap")
 end
 
@@ -1321,6 +1377,7 @@ joinBtn.MouseButton1Click:Connect(function()
 	joinBusy = autoJoinEnabled
 	bootstrapStarted, lastBootstrapClick, bootstrapClicks = os.clock(), -math.huge, 0
 	joinAwaitingRules, joinAwaitingEvent, joinEventSeen = false, false, false
+	joinContinued, joinAgreed, rulesSeen, joinDone, agreeMissing = false, false, false, false, 0
 	lastClickTarget, lastClickAt = nil, 0
 	joinBtn.Text = "Auto Masuk: " .. (autoJoinEnabled and "ON" or "OFF")
 	joinBtn.BackgroundColor3 = autoJoinEnabled and GREEN or RED
@@ -1329,7 +1386,7 @@ end)
 
 task.spawn(function()
 	while running do
-		task.wait(joinBusy and 0.2 or 1)
+		task.wait((joinBusy or eventOpen) and 0.2 or 1)
 		if not running then break end
 		local ok, err = xpcall(processJoin, function(message) return debug.traceback(tostring(message), 2) end)
 		if not ok then
@@ -1406,8 +1463,9 @@ end
 
 -- Pemeriksaan terakhir juga dilakukan sesudah HTTP, karena ayam bisa muncul
 -- atau baru menempel ke karakter selama pencarian server berlangsung.
+-- Selama precheck (sudah Continue, belum agree) hop tetap diizinkan walau joinBusy.
 local function canAutoHop()
-	if not enabled or joinBusy or not refreshPlayer() or not farmCharacter() then return false end
+	if not enabled or (joinBusy and not joinPrecheck()) or not refreshPlayer() or not farmCharacter() then return false end
 	if isHolding() or os.clock() < grabPendingUntil then return false end
 	return nearestTurkey() == nil
 end
@@ -1448,7 +1506,9 @@ local function searchServers(generation, automatic)
 	local cursor = ""
 	local seenCursors = {}
 	local attempts = 0
+	local pageNo, skipped = 0, 0
 	while hopActive(generation) do
+		pageNo += 1
 		if automatic and not canAutoHop() then return "lanjut mengambil atau mengirim ayam" end
 		local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
 		if cursor ~= "" then url ..= "&cursor=" .. HttpService:UrlEncode(cursor) end
@@ -1456,23 +1516,39 @@ local function searchServers(generation, automatic)
 		for retry = 1, 3 do
 			if not hopActive(generation) then return end
 			if automatic and not canAutoHop() then return "lanjut mengambil atau mengirim ayam" end
-			setHopStatus("mencari server dengan slot kosong...")
-			local ok, data = pcall(function()
-				local decoded = HttpService:JSONDecode(game:HttpGet(url))
-				if type(decoded) ~= "table" or type(decoded.data) ~= "table" then
-					error("respons daftar server tidak valid")
-				end
-				return decoded
+			setHopStatus(string.format("cari server: halaman %d, dilewati %d...", pageNo, skipped))
+			-- HttpGet kadang nggak pernah balas (nggak ada timeout bawaan), jadi dijalankan di thread
+			-- terpisah dan ditunggu maksimal 15 detik.
+			local result = { done = false }
+			task.spawn(function()
+				local okCall, response = pcall(function()
+					local decoded = HttpService:JSONDecode(game:HttpGet(url))
+					if type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+						error("respons daftar server tidak valid")
+					end
+					return decoded
+				end)
+				result.ok, result.data, result.done = okCall, response, true
 			end)
+			local waited = os.clock()
+			while not result.done and hopActive(generation) and os.clock() - waited < 15 do task.wait(0.2) end
 			if not hopActive(generation) then return end
+			local ok, data
+			if result.done then
+				ok, data = result.ok, result.data
+			else
+				ok, data = false, "timeout 15 detik, HttpGet tidak membalas"
+			end
 			if ok then
 				page = data
 				break
 			end
 			warn("[TurkeyAuto] gagal mengambil daftar server: " .. tostring(data))
 			if retry < 3 then
-				setHopStatus("koneksi gagal, mencoba lagi...")
-				task.wait(2 ^ retry)
+				-- 429 = kena rate limit Roblox, kasih jeda lebih lama
+				local limited = tostring(data):find("429", 1, true) ~= nil
+				setHopStatus(limited and "kena rate limit Roblox, nunggu sebentar..." or "koneksi gagal, mencoba lagi...")
+				task.wait(limited and 10 * retry or 2 ^ retry)
 			end
 		end
 		if not page then return "gagal mengambil server, cek console" end
@@ -1485,7 +1561,10 @@ local function searchServers(generation, automatic)
 			local id = server.id
 			local playing, maxPlayers = tonumber(server.playing), tonumber(server.maxPlayers)
 			if type(id) ~= "string" or id == "" or id == game.JobId or serverHistory.ids[id]
-				or not playing or not maxPlayers or playing < 0 or playing >= maxPlayers then continue end
+				or not playing or not maxPlayers or playing < 0 or playing >= maxPlayers then
+				skipped += 1
+				continue
+			end
 
 			attempts += 1
 			local attempt = { id = id }
@@ -1672,11 +1751,36 @@ task.spawn(function()
 		task.wait(0.15)
 		if not running then break end
 		refreshPlayer()
-		if hopBusy or joinBusy then continue end
-		local me = farmCharacter()
+		if hopBusy then continue end
+		if joinBusy then
+			-- Sudah lewat Continue tapi belum agree: cek ayam, kalau kosong langsung pindah server
+			if joinPrecheck() and enabled and farmCharacter()
+				and os.clock() - joinContinuedAt >= PRECHECK_SETTLE then
+				if nearestTurkey() == nil and not isHolding() then
+					emptyScans += 1
+					if emptyScans >= 2 then
+						joinMessage("tidak ada ayam setelah Continue, pindah server...")
+						startServerHop(true)
+					end
+				else
+					emptyScans = 0
+				end
+			end
+			continue
+		end
+		local me, hum = farmCharacter()
 		if not me then
 			emptyScans = 0
 			setStatus("menunggu karakter siap...", true)
+			continue
+		end
+		-- lagi duduk (kursi/seat)? lompat dulu sampai berdiri, nggak bisa grab kalau masih duduk
+		if (enabled or sendEnabled) and hum and hum.Sit then
+			setStatus("lagi duduk, lompat dulu biar berdiri...", true)
+			hum.Sit = false
+			hum.Jump = true
+			pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+			task.wait(0.35)
 			continue
 		end
 		local holding = isHolding()
@@ -1716,9 +1820,15 @@ task.spawn(function()
 					emptyScans = 0
 					setStatus("ayam kecil habis, menunggu percobaan pindah server...", true)
 				else
-					-- Konfirmasi dua pemindaian singkat untuk perubahan replika sesaat.
-					emptyScans += 1
-					if emptyScans >= 2 then startServerHop(true) end
+					if os.clock() - joinDoneAt < SETTLE_AFTER_JOIN then
+						-- baru masuk: kasih sebentar biar ayam di sekitar ke-load dulu
+						emptyScans = 0
+						setStatus("memeriksa ayam di sekitar...", true)
+					else
+						-- Konfirmasi dua pemindaian singkat untuk perubahan replika sesaat.
+						emptyScans += 1
+						if emptyScans >= 2 then startServerHop(true) end
+					end
 				end
 			else
 				emptyScans = 0
